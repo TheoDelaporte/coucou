@@ -74,7 +74,18 @@ final class IslandStateMachine {
 
     /// Compact island clicked
     func click() {
-        guard state == .petit else { return }
+        cancelTimers()
+        transition(to: .home)
+    }
+
+    /// Forcibly transition to petit (compact mode) immediately
+    func forceCollapse() {
+        cancelTimers()
+        transition(to: .petit)
+    }
+
+    /// Forcibly transition to home (expanded mode) immediately
+    func forceExpand() {
         cancelTimers()
         transition(to: .home)
     }

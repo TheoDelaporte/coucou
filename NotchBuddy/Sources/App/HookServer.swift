@@ -115,16 +115,24 @@ final class HookServer: @unchecked Sendable {
     @MainActor
     private func processEvent(name: String, payload: [String: Any]) {
         let state = AppState.shared
-        let sessionId = payload["session_id"] as? String ?? "unknown"
-        let cwd = payload["cwd"] as? String ?? ""
+        let sessionId = payload["session_id"] as? String
+            ?? payload["conversationId"] as? String
+            ?? "unknown"
+        var cwd = payload["cwd"] as? String ?? ""
+        if cwd.isEmpty, let workspaces = payload["workspacePaths"] as? [String], let first = workspaces.first {
+            cwd = first
+        }
         let rawName = URL(fileURLWithPath: cwd).lastPathComponent
-        let projectName = aliasProjectName(rawName.isEmpty ? "Session" : rawName)
+        let projectName = aliasProjectName(rawName.isEmpty ? "Antigravity" : rawName)
 
         let termProgram = payload["term_program"] as? String ?? ""
         let bundleId    = payload["bundle_id"]    as? String ?? ""
-        let isVSCode = termProgram.lowercased().contains("vscode") ||
-                       bundleId.lowercased().contains("vscode")
-        guard isVSCode else {
+        let isEditor = termProgram.lowercased().contains("antigravity") ||
+                       bundleId.lowercased().contains("antigravity") ||
+                       termProgram.lowercased().contains("vscode") ||
+                       bundleId.lowercased().contains("vscode") ||
+                       payload["conversationId"] != nil
+        guard isEditor else {
             nbLog("Ignored \(name) from \(termProgram.isEmpty ? bundleId : termProgram) (\(projectName))")
             return
         }
@@ -140,12 +148,14 @@ final class HookServer: @unchecked Sendable {
             if state.isPresent { expandIfNeeded(to: .overview) }
             SoundEngine.shared.play("work")
 
-        case "UserPromptSubmit":
+        case "PreInvocation", "UserPromptSubmit":
             activeSessionId = sessionId
             upsertTask(projectName: projectName, cwd: cwd)
             state.updateTask(id: "integration_claude", state: .thinking)
             if let prompt = payload["prompt"] as? String, !prompt.isEmpty {
                 appendStep(id: "integration_claude", step: String(prompt.prefix(60)))
+            } else {
+                appendStep(id: "integration_claude", step: "Prompt…")
             }
             if state.isPresent { expandIfNeeded(to: .overview) }
 
@@ -153,14 +163,31 @@ final class HookServer: @unchecked Sendable {
             activeSessionId = sessionId
             upsertTask(projectName: projectName, cwd: cwd)
             state.updateTask(id: "integration_claude", state: .working)
-            let tool = payload["tool_name"] as? String ?? "Tool"
-            let input = payload["tool_input"] as? [String: Any] ?? [:]
-            let step = frenchStep(tool: tool, input: input)
+            var tool = payload["tool_name"] as? String
+            var input = payload["tool_input"] as? [String: Any]
+            if tool == nil, let tc = payload["toolCall"] as? [String: Any] {
+                tool = tc["name"] as? String
+                input = tc["args"] as? [String: Any]
+            }
+            let step = frenchStep(tool: tool ?? "Tool", input: input ?? [:])
             appendStep(id: "integration_claude", step: step)
             nbLog("PreToolUse \(step)")
 
         case "PostToolUse":
             state.updateTask(id: "integration_claude", state: .working)
+
+        case "PostInvocation":
+            state.updateTask(id: "integration_claude", state: .finished)
+            SoundEngine.shared.play("finish")
+            if focused {
+                expandIfNeeded(to: .finished)
+            } else {
+                setPillBadge(id: "integration_claude", badge: .finished)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5.2) {
+                state.updateTask(id: "integration_claude", state: .idle)
+                self.clearPillBadge(id: "integration_claude")
+            }
 
         case "PostToolUseFailure":
             state.updateTask(id: "integration_claude", state: .working)
@@ -216,6 +243,11 @@ final class HookServer: @unchecked Sendable {
         default:
             break
         }
+
+        // Trigger live context budget refresh
+        DispatchQueue.global(qos: .background).async {
+            AntigravityContextService.shared.refresh()
+        }
     }
 
     // MARK: - Helpers
@@ -253,9 +285,11 @@ final class HookServer: @unchecked Sendable {
 
         let termProgram = payload["term_program"] as? String ?? ""
         let bundleId    = payload["bundle_id"]    as? String ?? ""
-        let isVSCode = termProgram.lowercased().contains("vscode") ||
+        let isEditor = termProgram.lowercased().contains("antigravity") ||
+                       bundleId.lowercased().contains("antigravity") ||
+                       termProgram.lowercased().contains("vscode") ||
                        bundleId.lowercased().contains("vscode")
-        guard isVSCode else {
+        guard isEditor else {
             Task.detached { [weak self] in
                 self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
                 close(fd)
@@ -360,7 +394,7 @@ final class HookServer: @unchecked Sendable {
         guard let idx = state.tasks.firstIndex(where: { $0.id == "integration_claude" }) else { return }
         state.tasks[idx].steps = []
         state.tasks[idx].stepIndex = 0
-        state.tasks[idx].name = "VS Code"
+        state.tasks[idx].name = "Antigravity"
         state.tasks[idx].pillBadge = nil
     }
 
@@ -493,6 +527,68 @@ final class HookServer: @unchecked Sendable {
             }
         }
         return false
+    }
+
+    // MARK: - Antigravity hooks.json installer
+
+    static var geminiConfigDir: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gemini/config")
+    }
+
+    static var geminiHooksURL: URL {
+        geminiConfigDir.appendingPathComponent("hooks.json")
+    }
+
+    static func antigravityHooksInstalled() -> Bool {
+        guard let data = try? Data(contentsOf: geminiHooksURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        return json["coucou"] != nil
+    }
+
+    func installAntigravityHooks() throws {
+        installHookScript()
+        let hookPath = Self.hookScriptPath
+        let dir = Self.geminiConfigDir
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        var hooksConfig: [String: Any] = [:]
+        if let data = try? Data(contentsOf: Self.geminiHooksURL),
+           let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            hooksConfig = parsed
+        }
+
+        let coucouHook: [String: Any] = [
+            "PreInvocation": [
+                ["type": "command", "command": "\"\(hookPath)\" PreInvocation", "timeout": 10]
+            ],
+            "PostInvocation": [
+                ["type": "command", "command": "\"\(hookPath)\" PostInvocation", "timeout": 10]
+            ],
+            "PreToolUse": [
+                ["matcher": "*", "hooks": [["type": "command", "command": "\"\(hookPath)\" PreToolUse", "timeout": 10]]]
+            ],
+            "PostToolUse": [
+                ["matcher": "*", "hooks": [["type": "command", "command": "\"\(hookPath)\" PostToolUse", "timeout": 10]]]
+            ],
+            "Stop": [
+                ["type": "command", "command": "\"\(hookPath)\" Stop", "timeout": 10]
+            ]
+        ]
+
+        hooksConfig["coucou"] = coucouHook
+        let data = try JSONSerialization.data(withJSONObject: hooksConfig, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: Self.geminiHooksURL, options: .atomic)
+    }
+
+    func uninstallAntigravityHooks() throws {
+        guard FileManager.default.fileExists(atPath: Self.geminiHooksURL.path) else { return }
+        guard let data = try? Data(contentsOf: Self.geminiHooksURL),
+              var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        json.removeValue(forKey: "coucou")
+        let outData = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+        try outData.write(to: Self.geminiHooksURL, options: .atomic)
     }
 
     // MARK: - Claude Code settings.json hook installer
@@ -708,6 +804,22 @@ def main():
         payload['cwd'] = os.getcwd()
 
     event = payload.get('hook_event_name', '')
+    if not event and len(sys.argv) > 1:
+        event = sys.argv[1]
+    payload['hook_event_name'] = event
+
+    # Enrich with terminal / IDE context
+    env = os.environ
+    payload.setdefault('term_program', env.get('TERM_PROGRAM', 'antigravity'))
+    payload.setdefault('iterm_session_id', env.get('ITERM_SESSION_ID', ''))
+    payload.setdefault('term_session_id', env.get('TERM_SESSION_ID', ''))
+    payload.setdefault('bundle_id', env.get('__CFBundleIdentifier', 'com.google.antigravity'))
+    if 'cwd' not in payload or not payload['cwd']:
+        if 'workspacePaths' in payload and payload['workspacePaths']:
+            payload['cwd'] = payload['workspacePaths'][0]
+        else:
+            payload['cwd'] = os.getcwd()
+
     socket_path = os.path.expanduser(
         '~/Library/Application Support/NotchBuddy/nb.sock'
     )
@@ -767,7 +879,10 @@ def main():
         s.sendall((json.dumps(payload) + '\\n').encode())
         s.close()
     except Exception:
-        pass  # Always exit cleanly — never block Claude Code
+        pass  # Always exit cleanly
+    # Return empty valid JSON object on stdout for Antigravity hooks
+    print('{}')
+    sys.exit(0)
 
 main()
 sys.exit(0)

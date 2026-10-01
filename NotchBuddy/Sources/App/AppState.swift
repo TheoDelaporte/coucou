@@ -4,9 +4,9 @@ import Combine
 
 // Integration pills — always-present, never purged
 extension AgentTask {
-    /// All available integration pills. Claude is always active; others are opt-in (max 4).
+    /// All available integration pills. Antigravity is always active; others are opt-in (max 4).
     static let integrationAgents: [AgentTask] = [
-        AgentTask(id: "integration_claude",  name: "VS Code",   color: "#F5F6F8", state: .idle, steps: [], source: .claudeCode, isIntegration: true),
+        AgentTask(id: "integration_claude",  name: "Antigravity",   color: "#F5F6F8", state: .idle, steps: [], source: .claudeCode, isIntegration: true),
         AgentTask(id: "integration_resend",  name: "Resend",    color: "#22C55E", state: .idle, steps: [], source: .n8n, isIntegration: true),
         AgentTask(id: "integration_n8n",     name: "n8n",       color: "#F29B38", state: .idle, steps: [], source: .n8n, isIntegration: true),
         AgentTask(id: "integration_vercel",  name: "Vercel",    color: "#7C5CFF", state: .idle, steps: [], source: .n8n, isIntegration: true),
@@ -16,7 +16,7 @@ extension AgentTask {
         AgentTask(id: "integration_stripe",  name: "Stripe",    color: "#0570DE", state: .idle, steps: [], source: .n8n, isIntegration: true),
     ]
 
-    /// IDs that can be toggled (VS Code is always on and excluded from this list)
+    /// IDs that can be toggled (Antigravity is always on and excluded from this list)
     static let toggleableIntegrationIds: [String] = [
         "integration_resend", "integration_n8n", "integration_vercel", "integration_github",
         "integration_notion", "integration_calcom", "integration_stripe",
@@ -134,7 +134,7 @@ final class AppState: ObservableObject {
         }
     }
 
-    // Active integration pills (VS Code excluded — always on). Max 4.
+    // Active integration pills (Antigravity excluded — always on). Max 4.
     @Published var activeIntegrations: Set<String> = ["integration_resend", "integration_n8n", "integration_vercel", "integration_github"] {
         didSet {
             if let data = try? JSONEncoder().encode(Array(activeIntegrations)) {
@@ -145,6 +145,9 @@ final class AppState: ObservableObject {
 
     // Pending API result
     @Published var searchResult: SearchResult? = nil
+
+    // Antigravity context budget (populated by AntigravityContextService)
+    @Published var antigravityBudget: AntigravityBudget? = nil
 
     // Vercel deployments (populated by VercelPoller)
     @Published var vercelDeployments: [VercelDeployment] = []
@@ -263,7 +266,7 @@ final class AppState: ObservableObject {
         else if view == .overview && tasks.isEmpty { view = .empty }
     }
 
-    /// Load integration pills respecting activeIntegrations. VS Code always loads. Safe to call multiple times.
+    /// Load integration pills respecting activeIntegrations. Antigravity always loads. Safe to call multiple times.
     func loadIntegrationTasks() {
         for task in AgentTask.integrationAgents {
             let shouldLoad = task.id == "integration_claude" || activeIntegrations.contains(task.id)
@@ -275,7 +278,7 @@ final class AppState: ObservableObject {
         syncMode()
     }
 
-    /// Toggle an integration pill on/off. VS Code cannot be toggled. Max 4 active at once.
+    /// Toggle an integration pill on/off. Antigravity cannot be toggled. Max 4 active at once.
     func toggleIntegration(_ id: String) {
         guard id != "integration_claude" else { return }
         if activeIntegrations.contains(id) {

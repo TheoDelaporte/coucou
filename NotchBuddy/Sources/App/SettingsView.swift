@@ -10,6 +10,7 @@ struct SettingsView: View {
     @State private var showDiff: Bool = false
     @State private var pendingHookJSON: String = ""
     @State private var hookNeedsUpdate: Bool = HookServer.hooksNeedUpdate()
+    @State private var antigravityHooksInstalled: Bool = HookServer.antigravityHooksInstalled()
     #if APPSTORE
     @State private var claudeAccessGranted: Bool = (UserDefaults.standard.data(forKey: "claudeDirectoryBookmark") != nil)
     #endif
@@ -64,8 +65,55 @@ struct SettingsView: View {
                 }
 
                 // MARK: Hooks
-                GroupBox("Claude Code Hooks") {
-                    VStack(alignment: .leading, spacing: 10) {
+                GroupBox("Antigravity & Claude Code Hooks") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        // Antigravity hooks section
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("Antigravity (~/.gemini/config/hooks.json)")
+                                    .font(.system(size: 12, weight: .semibold))
+                                Spacer()
+                                Circle()
+                                    .fill(antigravityHooksInstalled ? Color(hex: "#22C55E") : Color(hex: "#8E939C"))
+                                    .frame(width: 7, height: 7)
+                                Text(antigravityHooksInstalled ? "Installed" : "Not installed")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(antigravityHooksInstalled ? Color(hex: "#22C55E") : .secondary)
+                            }
+                            Text("Relays tool use, thinking, and completion events to Mochi.")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                            HStack(spacing: 10) {
+                                Button("Install Antigravity hooks") {
+                                    do {
+                                        try HookServer.shared.installAntigravityHooks()
+                                        antigravityHooksInstalled = true
+                                        statusMessage = "✓ Antigravity hooks installed in ~/.gemini/config/hooks.json"
+                                    } catch {
+                                        statusMessage = "❌ \(error.localizedDescription)"
+                                    }
+                                }
+                                .buttonStyle(.borderedProminent)
+
+                                Button("Uninstall") {
+                                    do {
+                                        try HookServer.shared.uninstallAntigravityHooks()
+                                        antigravityHooksInstalled = false
+                                        statusMessage = "✓ Antigravity hooks removed."
+                                    } catch {
+                                        statusMessage = "❌ \(error.localizedDescription)"
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        }
+
+                        Divider()
+
+                        // Claude Code hooks section
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Claude Code (~/.claude/settings.json)")
+                                .font(.system(size: 12, weight: .semibold))
                         if hookNeedsUpdate {
                             HStack(spacing: 6) {
                                 Image(systemName: "exclamationmark.triangle.fill")
@@ -104,11 +152,12 @@ struct SettingsView: View {
                             .foregroundColor(.secondary)
                         HStack(spacing: 10) {
                             Button("Install hooks") { installHooks() }
-                                .buttonStyle(.borderedProminent)
+                            .buttonStyle(.borderedProminent)
                             Button("Uninstall") { uninstallHooks() }
-                                .buttonStyle(.bordered)
+                            .buttonStyle(.bordered)
                         }
                         #endif
+                        }
 
                         if showDiff {
                             ScrollView {
@@ -276,7 +325,7 @@ struct SettingsView: View {
                 GroupBox("Active pills") {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
-                            Text("VS Code")
+                            Text("Antigravity")
                                 .font(.system(size: 12, weight: .semibold))
                             Circle().fill(Color(hex: "#F5F6F8")).frame(width: 8, height: 8)
                             Spacer()

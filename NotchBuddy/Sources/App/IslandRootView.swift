@@ -61,13 +61,19 @@ struct IslandContainer: View {
             // Content
             if state.mode == .expanded {
                 if greetingActive {
-                    // Greeting canvas: fixed 640-wide, centered by offset so x=320 aligns with island center
-                    GreetingCanvasView(state: state)
-                        .frame(width: IslandConst.expandedWidth, height: 150)
-                        .offset(x: (islandWidth - IslandConst.expandedWidth) / 2)
-                        .clipShape(IslandShape(width: islandWidth, height: islandHeight,
-                                              cornerRadius: cornerRadius, topRadius: islandTopRadius))
-                        .transition(.opacity)
+                    ZStack(alignment: .topTrailing) {
+                        // Greeting canvas: fixed 640-wide, centered by offset so x=320 aligns with island center
+                        GreetingCanvasView(state: state)
+                            .frame(width: IslandConst.expandedWidth, height: 150)
+                            .offset(x: (islandWidth - IslandConst.expandedWidth) / 2)
+                            .clipShape(IslandShape(width: islandWidth, height: islandHeight,
+                                                  cornerRadius: cornerRadius, topRadius: islandTopRadius))
+
+                        CollapseButton()
+                            .padding(.top, 10)
+                            .padding(.trailing, 14)
+                    }
+                    .transition(.opacity)
                 } else if uploadActive {
                     ZStack(alignment: .topLeading) {
                         UploadCanvasView(state: state)
@@ -473,8 +479,14 @@ struct IslandHeader: View {
 
             Spacer()
 
+            // Context budget pill
+            if let budget = state.antigravityBudget, budget.currentTokens > 0 {
+                ContextBudgetPill(budget: budget)
+                    .padding(.trailing, 12)
+            }
+
             // Right: action icons
-            HStack(spacing: 14) {
+            HStack(spacing: 12) {
                 Button(action: {
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                         state.view = .settings
@@ -492,10 +504,32 @@ struct IslandHeader: View {
                         .foregroundColor(Color(hex: "#8E939C"))
                 }
                 .buttonStyle(.plain)
+
+                CollapseButton()
             }
             .padding(.trailing, 16)
         }
         .frame(maxHeight: .infinity)
+    }
+}
+
+struct CollapseButton: View {
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: {
+            NotificationCenter.default.post(name: .islandCollapse, object: nil)
+        }) {
+            Image(systemName: "chevron.up")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(isHovered ? Color(hex: "#F5F6F8") : Color(hex: "#8E939C"))
+                .frame(width: 20, height: 20)
+                .background(isHovered ? Color.white.opacity(0.10) : Color.clear)
+                .clipShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .help("Rabattre la fenêtre (Échap)")
     }
 }
 

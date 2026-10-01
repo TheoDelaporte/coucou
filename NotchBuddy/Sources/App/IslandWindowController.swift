@@ -333,10 +333,10 @@ final class IslandWindowController: NSWindowController {
     }
 
     func collapse() {
+        pendingIslandClick = false
         state.isPinned = false
         finishedPinTimer?.cancel()
-        // Tell FSM we're going to compact (from home)
-        if fsm.state == .home { fsm.mouseLeft() }
+        fsm.forceCollapse()
         setMode(.compact)
         window?.resignKey()
     }
@@ -440,7 +440,8 @@ final class IslandWindowController: NSWindowController {
                 } else {
                     self.attachDragStart = nil
                     if hadPendingClick && self.state.mode != .expanded {
-                        self.fsm.click()   // FSM petit→home; onTransition calls expand(to:)
+                        self.fsm.forceExpand()
+                        self.expand(to: self.defaultView())
                     }
                 }
             }
