@@ -42,9 +42,15 @@ final class IslandWindowController: NSWindowController {
     // Notch real dimensions (set on init)
     private var notchW: CGFloat = IslandConst.notchWidth
     private var notchH: CGFloat = IslandConst.notchHeight
+    private var currentScreen: NSScreen?
+
+    // Multi-screen / Nomad relocation timing & animation
+    private var screenRelocateTimer: DispatchWorkItem?
+    private var pendingRelocateScreen: NSScreen?
+    private var isRelocating: Bool = false
 
     convenience init() {
-        let screen = Self.notchScreen() ?? NSScreen.main!
+        let screen = Self.targetScreen(for: NSEvent.mouseLocation)
         let nW = Self.notchWidth(for: screen)
         let nH = Self.notchHeight(for: screen)
 
@@ -62,6 +68,7 @@ final class IslandWindowController: NSWindowController {
 
         self.init(window: panel)
         self.islandPanel = panel
+        self.currentScreen = screen
         self.notchW = nW
         self.notchH = nH
         setupPanel(screen: screen)
@@ -79,6 +86,15 @@ final class IslandWindowController: NSWindowController {
         // Propagate real notch dimensions to AppState
         AppState.shared.notchWidth  = notchW
         AppState.shared.notchHeight = notchH
+        AppState.shared.hasPhysicalNotch = (screen.safeAreaInsets.top > 0)
+
+        // Observe screen configuration changes (e.g. DisplayLink dock connected/disconnected)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleScreenParametersChanged),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
 
         let contentSize = panel.contentRect(forFrameRect: panel.frame).size
 
@@ -204,6 +220,19 @@ final class IslandWindowController: NSWindowController {
 
         let mouse = NSEvent.mouseLocation
 
+        // Nomad island: smoothly follow cursor to active screen with debounce + fade
+        if state.mode != .expanded && !inAttachDrag && attachDragStart == nil && !isRelocating {
+            let targetScreen = Self.targetScreen(for: mouse)
+            let activeScreen = currentScreen ?? panel.screen
+            if targetScreen != activeScreen {
+                scheduleNomadRelocation(to: targetScreen)
+            } else if pendingRelocateScreen != nil {
+                // Mouse returned to current screen before delay expired: cancel
+                screenRelocateTimer?.cancel()
+                pendingRelocateScreen = nil
+            }
+        }
+
         // Convert mouse to panel-local coords (macOS: origin bottom-left)
         let pf = panel.frame
         let local = CGPoint(x: mouse.x - pf.minX, y: mouse.y - pf.minY)
@@ -222,8 +251,10 @@ final class IslandWindowController: NSWindowController {
         }
 
         // Mouse in screen coords (Y flipped, origin top-left) for Bot look-at
-        let screenH = panel.screen?.frame.height ?? NSScreen.main!.frame.height
-        let newPos = CGPoint(x: mouse.x - (panel.screen?.frame.minX ?? 0), y: screenH - mouse.y)
+        let activeScreen = panel.screen ?? currentScreen ?? NSScreen.main!
+        let screenOriginX = activeScreen.frame.minX
+        let screenMaxY = activeScreen.frame.maxY
+        let newPos = CGPoint(x: mouse.x - screenOriginX, y: screenMaxY - mouse.y)
         let cur = AppState.shared.mousePosition
         if abs(newPos.x - cur.x) > 1 || abs(newPos.y - cur.y) > 1 {
             AppState.shared.mousePosition = newPos
@@ -323,6 +354,7 @@ final class IslandWindowController: NSWindowController {
     }
 
     func expand(to view: IslandView) {
+        relocateToCurrentFocusScreen()
         state.view = view
         if state.mode == .expanded {
             // Already expanded — just switch view
@@ -364,6 +396,7 @@ final class IslandWindowController: NSWindowController {
         // Hook server compact reveal (non-alert work events: session start, tool use, etc.)
         NotificationCenter.default.addObserver(forName: .hookReveal, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
+            self.relocateToCurrentFocusScreen()
             self.fsm.reveal()
         }
 
@@ -752,13 +785,114 @@ final class IslandWindowController: NSWindowController {
         return dx*dx + dy*dy <= radius * radius
     }
 
-    // MARK: - Notch detection (static)
+    // MARK: - Screen relocation & Multi-screen support (Nomad Island)
+
+    @objc private func handleScreenParametersChanged() {
+        let screen = Self.targetScreen(for: NSEvent.mouseLocation)
+        relocate(to: screen, force: true, animated: false)
+    }
+
+    private func scheduleNomadRelocation(to targetScreen: NSScreen) {
+        guard pendingRelocateScreen != targetScreen else { return }
+        screenRelocateTimer?.cancel()
+        pendingRelocateScreen = targetScreen
+
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.pendingRelocateScreen = nil
+            let currentTarget = Self.targetScreen(for: NSEvent.mouseLocation)
+            if currentTarget == targetScreen {
+                self.relocate(to: targetScreen, animated: true)
+            }
+        }
+        screenRelocateTimer = item
+        // 350ms latency debounce: lets cursor settle on the monitor before moving
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: item)
+    }
+
+    func relocate(to screen: NSScreen, force: Bool = false, animated: Bool = false) {
+        guard let panel = window as? IslandPanel else { return }
+        screenRelocateTimer?.cancel()
+        pendingRelocateScreen = nil
+
+        let targetOrg = targetOrigin(for: screen)
+        if !force && currentScreen == screen && panel.frame.origin == targetOrg {
+            return
+        }
+
+        if animated && !force && state.mode != .hidden && panel.alphaValue > 0.05 {
+            isRelocating = true
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.15
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                panel.animator().alphaValue = 0.0
+            }, completionHandler: { [weak self] in
+                guard let self = self else { return }
+                self.applyScreenCoordinates(screen: screen, targetOrigin: targetOrg, panel: panel)
+                NSAnimationContext.runAnimationGroup({ ctx in
+                    ctx.duration = 0.22
+                    ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    panel.animator().alphaValue = 1.0
+                }, completionHandler: { [weak self] in
+                    self?.isRelocating = false
+                })
+            })
+        } else {
+            panel.alphaValue = 1.0
+            applyScreenCoordinates(screen: screen, targetOrigin: targetOrg, panel: panel)
+        }
+    }
+
+    private func applyScreenCoordinates(screen: NSScreen, targetOrigin: NSPoint, panel: IslandPanel) {
+        currentScreen = screen
+
+        let nW = Self.notchWidth(for: screen)
+        let nH = Self.notchHeight(for: screen)
+
+        self.notchW = nW
+        self.notchH = nH
+        panel.notchWidth = nW
+        panel.notchHeight = nH
+
+        state.notchWidth = nW
+        state.notchHeight = nH
+        state.hasPhysicalNotch = (screen.safeAreaInsets.top > 0)
+
+        panel.setFrameOrigin(targetOrigin)
+    }
+
+    func relocateToCurrentFocusScreen() {
+        let screen = Self.targetScreen(for: NSEvent.mouseLocation)
+        relocate(to: screen, animated: false)
+    }
+
+    private func targetOrigin(for screen: NSScreen) -> NSPoint {
+        let sf = screen.frame
+        let panelW: CGFloat = 720
+        let panelH: CGFloat = 320
+        return NSPoint(x: sf.midX - panelW / 2, y: sf.maxY - panelH)
+    }
+
+    // MARK: - Screen detection (static)
+
+    static func targetScreen(for mousePoint: NSPoint = NSEvent.mouseLocation) -> NSScreen {
+        if let s = NSScreen.screens.first(where: {
+            mousePoint.x >= $0.frame.minX && mousePoint.x <= $0.frame.maxX &&
+            mousePoint.y >= $0.frame.minY && mousePoint.y <= $0.frame.maxY
+        }) {
+            return s
+        }
+        return NSScreen.main ?? notchScreen() ?? NSScreen.screens.first ?? NSScreen.main!
+    }
 
     static func notchScreen() -> NSScreen? {
         NSScreen.screens.first { $0.safeAreaInsets.top > 0 }
     }
 
     static func notchWidth(for screen: NSScreen) -> CGFloat {
+        guard screen.safeAreaInsets.top > 0 else {
+            return IslandConst.notchWidth
+        }
         let aux = (screen.auxiliaryTopLeftArea?.width ?? 0) +
                   (screen.auxiliaryTopRightArea?.width ?? 0)
         let w = screen.frame.width - aux
@@ -766,8 +900,10 @@ final class IslandWindowController: NSWindowController {
     }
 
     static func notchHeight(for screen: NSScreen) -> CGFloat {
-        let h = screen.safeAreaInsets.top
-        return h > 0 ? h : IslandConst.notchHeight
+        guard screen.safeAreaInsets.top > 0 else {
+            return IslandConst.notchHeight
+        }
+        return screen.safeAreaInsets.top
     }
 
     nonisolated func cleanup() {

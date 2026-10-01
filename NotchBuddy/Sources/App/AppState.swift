@@ -39,9 +39,10 @@ final class AppState: ObservableObject {
     // Bot state override
     @Published var stateOverride: BotState? = nil
 
-    // Real notch dimensions (set by IslandWindowController on launch)
+    // Real notch dimensions (set by IslandWindowController on launch / screen relocate)
     var notchWidth:  CGFloat = IslandConst.notchWidth
     var notchHeight: CGFloat = IslandConst.notchHeight
+    @Published var hasPhysicalNotch: Bool = true
 
     // Last app active before NotchBuddy (for window context capture)
     var lastExternalApp: NSRunningApplication? = nil
