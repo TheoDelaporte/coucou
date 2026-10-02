@@ -281,7 +281,8 @@ final class HookServer: @unchecked Sendable {
         let isEditor = termProgram.lowercased().contains("antigravity") ||
                        bundleId.lowercased().contains("antigravity") ||
                        termProgram.lowercased().contains("vscode") ||
-                       bundleId.lowercased().contains("vscode")
+                       bundleId.lowercased().contains("vscode") ||
+                       payload["conversationId"] != nil
         guard isEditor else {
             Task.detached { [weak self] in
                 self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
@@ -290,10 +291,20 @@ final class HookServer: @unchecked Sendable {
             return
         }
 
-        let tool = payload["tool_name"] as? String ?? "Tool"
+        var tool = payload["tool_name"] as? String ?? "Tool"
         var command = tool
         if let input = payload["tool_input"] as? [String: Any] {
             command = input["command"] as? String ?? tool
+        }
+        if let tc = payload["toolCall"] as? [String: Any] {
+            if let name = tc["name"] as? String { tool = name }
+            if let args = tc["args"] as? [String: Any] {
+                if let cmd = args["CommandLine"] as? String {
+                    command = cmd
+                } else if let target = args["TargetFile"] as? String {
+                    command = target
+                }
+            }
         }
         nbLog("PermissionRequest \(tool): \(command)")
 
@@ -557,7 +568,7 @@ final class HookServer: @unchecked Sendable {
                 ["type": "command", "command": "\"\(hookPath)\" PreInvocation", "timeout": 10]
             ],
             "PreToolUse": [
-                ["matcher": "*", "hooks": [["type": "command", "command": "\"\(hookPath)\" PreToolUse", "timeout": 10]]]
+                ["matcher": "*", "hooks": [["type": "command", "command": "\"\(hookPath)\" PreToolUse", "timeout": 120]]]
             ],
             "PostToolUse": [
                 ["matcher": "*", "hooks": [["type": "command", "command": "\"\(hookPath)\" PostToolUse", "timeout": 10]]]
@@ -826,12 +837,20 @@ def main():
             except Exception:
                 pass
 
+    tool_call = payload.get('toolCall', {})
+    args = tool_call.get('args', {}) if tool_call else {}
+    tool_name = tool_call.get('name', '') if tool_call else payload.get('tool_name', '')
+    cmd = args.get('CommandLine', '') or payload.get('tool_input', {}).get('command', '')
+    target_file = args.get('TargetFile', '')
+    is_bypass = args.get('BypassSandbox') is True
+    is_antigravity = 'conversationId' in payload
+
     socket_path = os.path.expanduser(
         '~/Library/Application Support/NotchBuddy/nb.sock'
     )
 
-    if event == 'PermissionRequest':
-        # Block and wait for Coucou's decision (Claude Code allows up to 120s)
+    if event == 'PermissionRequest' and not is_antigravity:
+        # Claude Code PermissionRequest: blocking flow (up to 118s)
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(118)
@@ -840,11 +859,9 @@ def main():
             chunks = []
             while True:
                 chunk = s.recv(4096)
-                if not chunk:
-                    break
+                if not chunk: break
                 chunks.append(chunk)
-                if b'\\n' in chunk:
-                    break
+                if b'\\n' in chunk: break
             s.close()
             response = b''.join(chunks).decode().strip()
             if response:
@@ -859,7 +876,6 @@ def main():
                     sys.stdout.flush()
                     sys.exit(0)
                 elif decision == 'always':
-                    # Let Claude Code persist the rule via updatedPermissions
                     suggestions = payload.get('permission_suggestions', [])
                     out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow', 'updatedPermissions': suggestions}}}
                     sys.stdout.write(json.dumps(out) + '\\n')
@@ -870,12 +886,15 @@ def main():
                     sys.stdout.write(json.dumps(out) + '\\n')
                     sys.stdout.flush()
                     sys.exit(0)
-                # 'ask' or unknown: fall through → no output → Claude Code re-asks
         except Exception:
             pass
-        # App unreachable, timed out, or no explicit decision — print nothing
-        # Claude Code will handle the absence of output (re-ask or default behaviour)
         sys.exit(0)
+
+    # For Antigravity PreToolUse with BypassSandbox: notify Coucou with PermissionRequest alert
+    if is_antigravity and is_bypass:
+        payload['hook_event_name'] = 'PermissionRequest'
+        payload['tool_name'] = tool_name or 'Command'
+        payload['tool_input'] = {'command': cmd or target_file or tool_name}
 
     # All other events: fire-and-forget (0.3s timeout, never blocks)
     try:
