@@ -278,9 +278,14 @@ final class HookServer: @unchecked Sendable {
     @MainActor
     private func processPermissionRequest(fd: Int32, payload: [String: Any]) {
         let state = AppState.shared
-        let sessionId = payload["session_id"] as? String ?? "unknown"
-        let cwd       = payload["cwd"]        as? String ?? ""
-        let rawName   = URL(fileURLWithPath: cwd).lastPathComponent
+        let sessionId = payload["session_id"] as? String
+            ?? payload["conversationId"] as? String
+            ?? "unknown"
+        var cwd = payload["cwd"] as? String ?? ""
+        if cwd.isEmpty, let workspaces = payload["workspacePaths"] as? [String], let first = workspaces.first {
+            cwd = first
+        }
+        let rawName = URL(fileURLWithPath: cwd).lastPathComponent
         let projectName = aliasProjectName(rawName.isEmpty ? "Session" : rawName)
 
         let termProgram = payload["term_program"] as? String ?? ""
@@ -310,6 +315,11 @@ final class HookServer: @unchecked Sendable {
                     command = cmd
                 } else if let target = args["TargetFile"] as? String {
                     command = target
+                } else if let path = args["AbsolutePath"] as? String {
+                    command = path
+                } else if let server = args["ServerName"] as? String, let tname = args["ToolName"] as? String {
+                    tool = "\(server)/\(tname)"
+                    command = "\(server)/\(tname)"
                 }
             }
         }
@@ -820,13 +830,10 @@ def main():
     except Exception:
         return
 
-    # Enrich with terminal context
-    env = os.environ
-    payload.setdefault('term_program', env.get('TERM_PROGRAM', ''))
-    payload.setdefault('iterm_session_id', env.get('ITERM_SESSION_ID', ''))
-    payload.setdefault('term_session_id', env.get('TERM_SESSION_ID', ''))
-    payload.setdefault('bundle_id', env.get('__CFBundleIdentifier', ''))
-    if 'cwd' not in payload or not payload['cwd']:
+    # Project CWD resolution
+    if 'workspacePaths' in payload and payload['workspacePaths']:
+        payload['cwd'] = payload['workspacePaths'][0]
+    elif 'cwd' not in payload or not payload['cwd']:
         payload['cwd'] = os.getcwd()
 
     event = payload.get('hook_event_name', '')
@@ -840,11 +847,6 @@ def main():
     payload.setdefault('iterm_session_id', env.get('ITERM_SESSION_ID', ''))
     payload.setdefault('term_session_id', env.get('TERM_SESSION_ID', ''))
     payload.setdefault('bundle_id', env.get('__CFBundleIdentifier', 'com.google.antigravity'))
-    if 'cwd' not in payload or not payload['cwd']:
-        if 'workspacePaths' in payload and payload['workspacePaths']:
-            payload['cwd'] = payload['workspacePaths'][0]
-        else:
-            payload['cwd'] = os.getcwd()
 
     if event == 'PreInvocation' and ('prompt' not in payload or not payload['prompt']):
         t_path = payload.get('transcriptPath')
@@ -866,19 +868,47 @@ def main():
     args = tool_call.get('args', {}) if tool_call else {}
     tool_name = tool_call.get('name', '') if tool_call else payload.get('tool_name', '')
     cmd = args.get('CommandLine', '') or payload.get('tool_input', {}).get('command', '')
-    target_file = args.get('TargetFile', '')
+    target_file = args.get('TargetFile', '') or args.get('AbsolutePath', '')
     is_bypass = args.get('BypassSandbox') is True
     is_antigravity = 'conversationId' in payload
+
+    # Detection of tools requiring user approval in Antigravity:
+    is_mcp = (
+        tool_name == 'call_mcp_tool' or
+        '/' in tool_name or
+        tool_name.startswith('mcp_') or
+        tool_name.startswith('API-') or
+        args.get('ServerName') is not None
+    )
+    is_question = tool_name == 'ask_question'
+    needs_approval_antigravity = is_antigravity and event == 'PreToolUse' and (is_bypass or is_mcp or is_question)
+
+    if needs_approval_antigravity:
+        payload['hook_event_name'] = 'PermissionRequest'
+        if is_mcp:
+            server = args.get('ServerName', '')
+            tname = args.get('ToolName', '')
+            mcp_label = f"{server}/{tname}" if (server and tname) else tool_name
+            payload['tool_name'] = mcp_label
+            payload['tool_input'] = {'command': mcp_label}
+        elif is_question:
+            q_list = args.get('questions', [])
+            q_text = q_list[0].get('question', 'Question') if (isinstance(q_list, list) and q_list) else 'Question'
+            payload['tool_name'] = 'Question'
+            payload['tool_input'] = {'command': q_text}
+        else:
+            payload['tool_name'] = tool_name or 'Command'
+            payload['tool_input'] = {'command': cmd or target_file or tool_name}
 
     socket_path = os.path.expanduser(
         '~/Library/Application Support/NotchBuddy/nb.sock'
     )
 
-    if event == 'PermissionRequest' and not is_antigravity:
-        # Claude Code PermissionRequest: blocking flow (up to 118s)
+    if event == 'PermissionRequest' or needs_approval_antigravity:
+        # Blocking approval flow: wait for decision from Coucou (up to 115s)
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(118)
+            s.settimeout(115)
             s.connect(socket_path)
             s.sendall((json.dumps(payload) + '\\n').encode())
             chunks = []
@@ -895,31 +925,39 @@ def main():
                     decision = resp_obj.get('permissionDecision', '')
                 except Exception:
                     decision = ''
-                if decision == 'allow':
-                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow'}}}
+                if is_antigravity:
+                    if decision in ('allow', 'always'):
+                        out = {'decision': 'allow'}
+                    elif decision == 'deny':
+                        out = {'decision': 'deny', 'reason': 'Refusé depuis Coucou'}
+                    else:
+                        out = {'decision': 'ask'}
                     sys.stdout.write(json.dumps(out) + '\\n')
                     sys.stdout.flush()
                     sys.exit(0)
-                elif decision == 'always':
-                    suggestions = payload.get('permission_suggestions', [])
-                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow', 'updatedPermissions': suggestions}}}
-                    sys.stdout.write(json.dumps(out) + '\\n')
-                    sys.stdout.flush()
-                    sys.exit(0)
-                elif decision == 'deny':
-                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'deny', 'message': 'Denied from Coucou'}}}
-                    sys.stdout.write(json.dumps(out) + '\\n')
-                    sys.stdout.flush()
-                    sys.exit(0)
+                else:
+                    if decision == 'allow':
+                        out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow'}}}
+                        sys.stdout.write(json.dumps(out) + '\\n')
+                        sys.stdout.flush()
+                        sys.exit(0)
+                    elif decision == 'always':
+                        suggestions = payload.get('permission_suggestions', [])
+                        out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow', 'updatedPermissions': suggestions}}}
+                        sys.stdout.write(json.dumps(out) + '\\n')
+                        sys.stdout.flush()
+                        sys.exit(0)
+                    elif decision == 'deny':
+                        out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'deny', 'message': 'Denied from Coucou'}}}
+                        sys.stdout.write(json.dumps(out) + '\\n')
+                        sys.stdout.flush()
+                        sys.exit(0)
         except Exception:
             pass
+        if is_antigravity:
+            sys.stdout.write(json.dumps({'decision': 'ask'}) + '\\n')
+            sys.stdout.flush()
         sys.exit(0)
-
-    # For Antigravity PreToolUse with BypassSandbox: notify Coucou with PermissionRequest alert
-    if is_antigravity and is_bypass:
-        payload['hook_event_name'] = 'PermissionRequest'
-        payload['tool_name'] = tool_name or 'Command'
-        payload['tool_input'] = {'command': cmd or target_file or tool_name}
 
     # All other events: fire-and-forget (0.3s timeout, never blocks)
     try:
