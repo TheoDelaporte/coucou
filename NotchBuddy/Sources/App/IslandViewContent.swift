@@ -211,12 +211,20 @@ struct ApprovalView: View {
 
     var approval: ApprovalInfo? { state.pendingApproval }
 
+    var displayCommand: String {
+        let text = approval?.command ?? approval?.tool ?? "…"
+        let lines = text.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: true)
+        return lines.first.map(String.init) ?? text
+    }
+
     var body: some View {
         ZStack {
             CardBackground(wash: .amber)
             VStack(alignment: .leading, spacing: 5) {
                 AgentWho(task: state.focusTask, label: "needs permission", overrideName: approval?.projectName)
-                CodeBlock(text: approval?.command ?? approval?.tool ?? "…")
+                CodeBlock(text: displayCommand)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                 HStack(spacing: 8) {
                     SecondaryButton("Deny") {
                         HookServer.shared.sendApprovalDecision("deny")

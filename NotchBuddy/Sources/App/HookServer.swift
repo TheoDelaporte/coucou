@@ -28,8 +28,15 @@ final class HookServer: @unchecked Sendable {
     // No approval blocking state — notch is notification-only, user answers in VS Code
 
     private var serverFD: Int32 = -1
-    private var pendingApprovalFD: Int32 = -1   // held open while user decides
-    private var activeSessionId: String? = nil  // current Claude Code session
+    private struct PendingApprovalItem {
+        let fd: Int32
+        let sessionId: String
+        let projectName: String
+        let tool: String
+        let command: String
+    }
+    private var pendingApprovals: [String: PendingApprovalItem] = [:]   // held open per session
+    private var activeSessionId: String? = nil  // current active session
 
     private init() {}
 
@@ -185,25 +192,13 @@ final class HookServer: @unchecked Sendable {
             }
 
         case "PostToolUse":
-            if let pending = state.pendingApproval, pending.sessionId == sessionId {
-                state.pendingApproval = nil
-                state.isPinned = false
-                if state.view == .approval {
-                    state.view = state.tasks.isEmpty ? .empty : .overview
-                }
-            }
+            cleanupPendingApproval(for: sessionId)
             if state.pendingApproval == nil {
                 state.updateTask(id: "integration_claude", state: .working)
             }
 
         case "PostInvocation":
-            if let pending = state.pendingApproval, pending.sessionId == sessionId {
-                state.pendingApproval = nil
-                state.isPinned = false
-                if state.view == .approval {
-                    state.view = state.tasks.isEmpty ? .empty : .overview
-                }
-            }
+            cleanupPendingApproval(for: sessionId)
             break
 
         case "PostToolUseFailure":
@@ -222,13 +217,7 @@ final class HookServer: @unchecked Sendable {
             }
 
         case "Stop":
-            if let pending = state.pendingApproval, pending.sessionId == sessionId {
-                state.pendingApproval = nil
-                state.isPinned = false
-                if state.view == .approval {
-                    state.view = state.tasks.isEmpty ? .empty : .overview
-                }
-            }
+            cleanupPendingApproval(for: sessionId)
             state.updateTask(id: "integration_claude", state: .finished)
             if let message = payload["message"] as? String, !message.isEmpty {
                 appendStep(id: "integration_claude", step: String(message.prefix(60)))
@@ -277,6 +266,36 @@ final class HookServer: @unchecked Sendable {
     }
 
     // MARK: - Helpers
+
+    @MainActor
+    private func cleanupPendingApproval(for sessionId: String) {
+        if let item = pendingApprovals.removeValue(forKey: sessionId) {
+            let fd = item.fd
+            Task.detached { [weak self] in
+                self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
+                close(fd)
+            }
+        }
+        let state = AppState.shared
+        if state.pendingApproval?.sessionId == sessionId {
+            if let next = pendingApprovals.values.first {
+                state.pendingApproval = ApprovalInfo(
+                    sessionId: next.sessionId,
+                    projectName: next.projectName,
+                    tool: next.tool,
+                    command: next.command
+                )
+                state.isPinned = true
+                state.updateTask(id: "integration_claude", state: .approval)
+            } else {
+                state.pendingApproval = nil
+                state.isPinned = false
+                if state.view == .approval {
+                    state.view = state.tasks.isEmpty ? .empty : .overview
+                }
+            }
+        }
+    }
 
     @MainActor
     private func expandIfNeeded(to view: IslandView) {
@@ -354,15 +373,21 @@ final class HookServer: @unchecked Sendable {
         }
         nbLog("PermissionRequest \(tool): \(command)")
 
-        if pendingApprovalFD >= 0 {
-            let old = pendingApprovalFD
+        if let existing = pendingApprovals.removeValue(forKey: sessionId) {
+            let oldFd = existing.fd
             Task.detached { [weak self] in
-                // "ask" → nb-hook outputs nothing → Claude Code re-asks
-                self?.sendLine(fd: old, text: #"{"permissionDecision":"ask"}"#)
-                close(old)
+                self?.sendLine(fd: oldFd, text: #"{"permissionDecision":"ask"}"#)
+                close(oldFd)
             }
         }
-        pendingApprovalFD = fd
+        let item = PendingApprovalItem(
+            fd: fd,
+            sessionId: sessionId,
+            projectName: projectName,
+            tool: tool,
+            command: command
+        )
+        pendingApprovals[sessionId] = item
         activeSessionId = sessionId
 
         upsertTask(projectName: projectName, cwd: cwd)
@@ -375,19 +400,23 @@ final class HookServer: @unchecked Sendable {
         state.focusId = "integration_claude"
         expandIfNeeded(to: .approval)
 
-        let captured = fd
+        let capturedFd = fd
+        let capturedSessionId = sessionId
         DispatchQueue.main.asyncAfter(deadline: .now() + 115) { [weak self] in
-            guard let self, self.pendingApprovalFD == captured else { return }
-            // "ask" → nb-hook outputs nothing → Claude Code re-asks rather than denying
-            self.sendApprovalDecision("ask")
+            guard let self else { return }
+            if self.pendingApprovals[capturedSessionId]?.fd == capturedFd {
+                self.sendApprovalDecision("ask", forSession: capturedSessionId)
+            }
         }
     }
 
     /// Called by ApprovalView buttons. Writes the decision to the waiting nb-hook and cleans up.
     @MainActor
-    func sendApprovalDecision(_ decision: String) {
-        let fd = pendingApprovalFD
-        pendingApprovalFD = -1
+    func sendApprovalDecision(_ decision: String, forSession targetSessionId: String? = nil) {
+        let state = AppState.shared
+        let targetId = targetSessionId ?? state.pendingApproval?.sessionId ?? ""
+        let item = pendingApprovals.removeValue(forKey: targetId)
+            ?? pendingApprovals.values.first
 
         let json: String
         switch decision {
@@ -397,19 +426,32 @@ final class HookServer: @unchecked Sendable {
         default:       json = #"{"permissionDecision":"deny"}"#
         }
 
-        if fd >= 0 {
+        if let item = item {
+            let fd = item.fd
             Task.detached { [weak self] in
                 self?.sendLine(fd: fd, text: json)
                 close(fd)
             }
         }
 
-        let state = AppState.shared
-        state.pendingApproval = nil
-        state.isPinned = false
-        state.updateTask(id: "integration_claude", state: .working)
-        clearPillBadge(id: "integration_claude")
-        state.view = state.tasks.isEmpty ? .empty : .overview
+        // If there's another session waiting for approval, show it now
+        if let next = pendingApprovals.values.first {
+            state.pendingApproval = ApprovalInfo(
+                sessionId: next.sessionId,
+                projectName: next.projectName,
+                tool: next.tool,
+                command: next.command
+            )
+            state.isPinned = true
+            state.updateTask(id: "integration_claude", state: .approval)
+            expandIfNeeded(to: .approval)
+        } else {
+            state.pendingApproval = nil
+            state.isPinned = false
+            state.updateTask(id: "integration_claude", state: .working)
+            clearPillBadge(id: "integration_claude")
+            state.view = state.tasks.isEmpty ? .empty : .overview
+        }
     }
 
     /// Updates integration_claude with the current session project name and cwd.
@@ -902,17 +944,8 @@ def main():
     tool_name = tool_call.get('name', '') if tool_call else payload.get('tool_name', '')
     cmd = args.get('CommandLine', '') or payload.get('tool_input', {}).get('command', '')
     target_file = args.get('TargetFile', '') or args.get('AbsolutePath', '')
+    is_bypass = (args.get('BypassSandbox') is True)
     is_antigravity = 'conversationId' in payload
-
-    # Allowed tools cache for Antigravity (persistent Always-Allow)
-    allow_cache_file = os.path.expanduser('~/.gemini/antigravity/coucou_allowed_mcp.json')
-    allowed_tools = set()
-    if os.path.exists(allow_cache_file):
-        try:
-            with open(allow_cache_file, 'r', encoding='utf-8') as f:
-                allowed_tools = set(json.load(f))
-        except Exception:
-            pass
 
     server_name = args.get('ServerName', '')
     mcp_tool_name = args.get('ToolName', '')
@@ -923,14 +956,39 @@ def main():
     )
     is_question = (tool_name == 'ask_question')
     mcp_id = f"{server_name}/{mcp_tool_name}" if (server_name and mcp_tool_name) else (server_name or tool_name)
+    action_label = tool_call.get('toolAction') or args.get('toolAction') or ''
 
-    # If MCP tool was already marked as Always Allowed by the user in Coucou:
-    if is_antigravity and is_mcp and (mcp_id in allowed_tools or server_name in allowed_tools):
+    # Cache file for Always-Allowed items
+    allow_cache_file = os.path.expanduser('~/.gemini/antigravity/coucou_always_allowed.json')
+    allowed_items = set()
+    if os.path.exists(allow_cache_file):
+        try:
+            with open(allow_cache_file, 'r', encoding='utf-8') as f:
+                allowed_items = set(json.load(f))
+        except Exception:
+            pass
+
+    cmd_prefix = ''
+    if cmd:
+        cmd_clean = cmd.strip()
+        cmd_prefix = cmd_clean.split()[0] if cmd_clean else ''
+        if cmd_prefix in ('sudo', 'env', 'sh', 'bash', 'zsh') and len(cmd_clean.split()) > 1:
+            cmd_prefix = cmd_clean.split()[1]
+
+    # Check if tool, MCP server, or command prefix is already always-allowed:
+    is_always_allowed = False
+    if is_antigravity:
+        if is_mcp and (mcp_id in allowed_items or server_name in allowed_items):
+            is_always_allowed = True
+        elif is_bypass and cmd_prefix and cmd_prefix in allowed_items:
+            is_always_allowed = True
+
+    if is_always_allowed:
         sys.stdout.write(json.dumps({'decision': 'allow'}) + '\\n')
         sys.stdout.flush()
         payload['hook_event_name'] = 'PreToolUse'
-        payload['tool_name'] = mcp_id
-        payload['tool_input'] = {'command': mcp_id}
+        payload['tool_name'] = tool_name
+        payload['tool_input'] = {'command': cmd or target_file or tool_name}
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(0.3)
@@ -941,10 +999,11 @@ def main():
             pass
         sys.exit(0)
 
-    # In Antigravity, only prompt for tools requiring external approval:
-    # 1. MCP tool calls (external integrations: Notion, Serena, Stitch, etc.)
+    # In Antigravity, we prompt in Coucou for:
+    # 1. MCP tool calls (Notion, Serena, Stitch, etc.)
     # 2. Interactive questions (ask_question)
-    needs_approval_antigravity = is_antigravity and event == 'PreToolUse' and (is_mcp or is_question)
+    # 3. Terminal commands running outside sandbox (BypassSandbox: true)
+    needs_approval_antigravity = is_antigravity and event == 'PreToolUse' and (is_bypass or is_mcp or is_question)
 
     if needs_approval_antigravity:
         payload['hook_event_name'] = 'PermissionRequest'
@@ -957,7 +1016,7 @@ def main():
             payload['tool_name'] = 'Question'
             payload['tool_input'] = {'command': q_text}
         else:
-            payload['tool_name'] = tool_name or 'Command'
+            payload['tool_name'] = action_label or tool_name or 'Command'
             payload['tool_input'] = {'command': cmd or target_file or tool_name}
 
     if event == 'PermissionRequest' or needs_approval_antigravity:
@@ -984,12 +1043,15 @@ def main():
                 if is_antigravity:
                     if decision == 'always':
                         try:
-                            allowed_tools.add(mcp_id)
-                            if server_name:
-                                allowed_tools.add(server_name)
+                            if is_mcp:
+                                allowed_items.add(mcp_id)
+                                if server_name:
+                                    allowed_items.add(server_name)
+                            elif is_bypass and cmd_prefix:
+                                allowed_items.add(cmd_prefix)
                             os.makedirs(os.path.dirname(allow_cache_file), exist_ok=True)
                             with open(allow_cache_file, 'w', encoding='utf-8') as f:
-                                json.dump(list(allowed_tools), f)
+                                json.dump(list(allowed_items), f)
                         except Exception:
                             pass
                         out = {'decision': 'allow'}
