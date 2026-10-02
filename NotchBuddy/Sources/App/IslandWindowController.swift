@@ -86,6 +86,7 @@ final class IslandWindowController: NSWindowController {
         // Propagate real notch dimensions to AppState
         AppState.shared.notchWidth  = notchW
         AppState.shared.notchHeight = notchH
+        AppState.shared.screenWidth = screen.frame.width
         AppState.shared.hasPhysicalNotch = (screen.safeAreaInsets.top > 0)
 
         // Observe screen configuration changes (e.g. DisplayLink dock connected/disconnected)
@@ -856,6 +857,7 @@ final class IslandWindowController: NSWindowController {
 
         state.notchWidth = nW
         state.notchHeight = nH
+        state.screenWidth = screen.frame.width
         state.hasPhysicalNotch = (screen.safeAreaInsets.top > 0)
 
         panel.setFrameOrigin(targetOrigin)

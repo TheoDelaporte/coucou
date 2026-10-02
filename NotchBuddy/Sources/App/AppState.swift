@@ -42,6 +42,7 @@ final class AppState: ObservableObject {
     // Real notch dimensions (set by IslandWindowController on launch / screen relocate)
     var notchWidth:  CGFloat = IslandConst.notchWidth
     var notchHeight: CGFloat = IslandConst.notchHeight
+    var screenWidth: CGFloat = NSScreen.main?.frame.width ?? 1728
     @Published var hasPhysicalNotch: Bool = true
 
     // Last app active before NotchBuddy (for window context capture)

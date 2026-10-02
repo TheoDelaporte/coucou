@@ -152,17 +152,21 @@ final class HookServer: @unchecked Sendable {
             activeSessionId = sessionId
             upsertTask(projectName: projectName, cwd: cwd)
             state.updateTask(id: "integration_claude", state: .thinking)
+            state.focusId = "integration_claude"
             if let prompt = payload["prompt"] as? String, !prompt.isEmpty {
                 appendStep(id: "integration_claude", step: String(prompt.prefix(60)))
             } else {
                 appendStep(id: "integration_claude", step: "Réflexion…")
             }
-            // Discreet thinking in the notch: do not force expand/reveal
+            if state.mode == .hidden {
+                NotificationCenter.default.post(name: .hookReveal, object: nil)
+            }
 
         case "PreToolUse":
             activeSessionId = sessionId
             upsertTask(projectName: projectName, cwd: cwd)
             state.updateTask(id: "integration_claude", state: .working)
+            state.focusId = "integration_claude"
             var tool = payload["tool_name"] as? String
             var input = payload["tool_input"] as? [String: Any]
             if tool == nil, let tc = payload["toolCall"] as? [String: Any] {
@@ -172,6 +176,9 @@ final class HookServer: @unchecked Sendable {
             let step = frenchStep(tool: tool ?? "Tool", input: input ?? [:])
             appendStep(id: "integration_claude", step: step)
             nbLog("PreToolUse \(step)")
+            if state.mode == .hidden {
+                NotificationCenter.default.post(name: .hookReveal, object: nil)
+            }
 
         case "PostToolUse":
             state.updateTask(id: "integration_claude", state: .working)
@@ -426,6 +433,7 @@ final class HookServer: @unchecked Sendable {
 
     private func frenchStep(tool: String, input: [String: Any]) -> String {
         let labels: [String: String] = [
+            // Claude Code
             "Bash":       "Exécute",
             "Read":       "Lit",
             "Write":      "Écrit",
@@ -439,17 +447,34 @@ final class HookServer: @unchecked Sendable {
             "LS":         "Liste",
             "MultiEdit":  "Modifie",
             "NotebookEdit": "Notebook",
+            // Antigravity
+            "run_command":          "Exécute",
+            "view_file":            "Lit",
+            "replace_file_content": "Modifie",
+            "write_to_file":        "Écrit",
+            "search_web":           "Recherche web",
+            "read_url_content":     "Récupère",
+            "ask_question":         "Question",
+            "call_mcp_tool":        "Outil",
+            "manage_task":          "Tâche",
+            "schedule":             "Planifie",
+            "invoke_subagent":      "Sous-agent",
         ]
         let label = labels[tool] ?? tool
-        if let cmd = input["command"] as? String {
+        if let cmd = (input["command"] as? String) ?? (input["CommandLine"] as? String) {
             let short = String(cmd.prefix(40))
             return "\(label) · \(short)"
-        } else if let path = input["path"] as? String {
+        } else if let path = (input["path"] as? String) ?? (input["AbsolutePath"] as? String) ?? (input["TargetFile"] as? String) {
             return "\(label) · \(URL(fileURLWithPath: path).lastPathComponent)"
         } else if let file = input["file_path"] as? String {
             return "\(label) · \(URL(fileURLWithPath: file).lastPathComponent)"
         } else if let query = input["query"] as? String {
             return "\(label) · \(String(query.prefix(40)))"
+        } else if let url = input["Url"] as? String {
+            let host = URL(string: url)?.host ?? String(url.prefix(30))
+            return "\(label) · \(host)"
+        } else if let toolName = input["ToolName"] as? String {
+            return "\(label) · \(toolName)"
         }
         return label
     }

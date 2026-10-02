@@ -91,15 +91,14 @@ struct BotCanvasView: View {
     }
 
     private func lookX(state: AppState, size: CGSize) -> CGFloat {
-        let screen = NSScreen.main ?? NSScreen.screens[0]
         let (islandW, islandH) = islandSize(mode: state.mode, view: state.view,
                                              progress: state.uploadProgress,
                                              nw: state.notchWidth, nh: state.notchHeight)
         let (botCx, _, _, _) = botPosition(mode: state.mode, view: state.view,
                                             islandW: islandW, islandH: islandH,
                                             uploadProgress: state.uploadProgress)
-        // Island is centered on screen; bot is at botCx within island coords
-        let botScreenX = screen.frame.midX - islandW / 2 + botCx
+        // Island is horizontally centered on the active screen: left edge at (screenWidth - islandW) / 2
+        let botScreenX = (state.screenWidth - islandW) / 2 + botCx
         return tanh((state.mousePosition.x - botScreenX) / 260)
     }
 
