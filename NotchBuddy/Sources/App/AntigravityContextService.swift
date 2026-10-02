@@ -197,7 +197,7 @@ public final class AntigravityContextService: @unchecked Sendable {
 
         // 2. Query SQLite for promptText (gen_metadata)
         let promptText = readPromptFromDb(at: dbURL.path) ?? ""
-        let inputTokens = Int(round(Double(promptText.count) / charsPerToken))
+        var inputTokens = Int(round(Double(promptText.count) / charsPerToken))
 
         let rulesText = extractTag(from: promptText, tag: "user_rules")
         let skillsText = extractTag(from: promptText, tag: "skills")
@@ -208,7 +208,10 @@ public final class AntigravityContextService: @unchecked Sendable {
         let mcpTokens = Int(round(Double(mcpText.count) / charsPerToken))
 
         // 3. Output tokens from transcript.jsonl
-        let (outputTokens, contentTokens, thinkingTokens) = readTranscriptOutput(brainDir: brainDir, convId: convId)
+        let (outputTokens, contentTokens, thinkingTokens, fallbackInput) = readTranscriptOutput(brainDir: brainDir, convId: convId)
+        if inputTokens == 0 {
+            inputTokens = fallbackInput
+        }
 
         let totalTokens = inputTokens + outputTokens
         let percentage = (Double(totalTokens) / Double(maxBudgetDefault)) * 100.0
@@ -264,13 +267,13 @@ public final class AntigravityContextService: @unchecked Sendable {
             if let blob = sqlite3_column_blob(statement, 0) {
                 let bytes = sqlite3_column_bytes(statement, 0)
                 let data = Data(bytes: blob, count: Int(bytes))
-                return String(data: data, encoding: .utf8)
+                return String(decoding: data, as: UTF8.self)
             }
         }
         return nil
     }
 
-    private func readTranscriptOutput(brainDir: URL, convId: String) -> (total: Int, content: Int, thinking: Int) {
+    private func readTranscriptOutput(brainDir: URL, convId: String) -> (total: Int, content: Int, thinking: Int, fallbackInput: Int) {
         let transcriptURL = brainDir
             .appendingPathComponent(convId)
             .appendingPathComponent(".system_generated")
@@ -279,33 +282,40 @@ public final class AntigravityContextService: @unchecked Sendable {
 
         guard FileManager.default.fileExists(atPath: transcriptURL.path),
               let content = try? String(contentsOf: transcriptURL, encoding: .utf8) else {
-            return (0, 0, 0)
+            return (0, 0, 0, 0)
         }
 
         var contentChars = 0
         var thinkingChars = 0
+        var otherChars = 0
 
         let lines = content.split(separator: "\n")
         for line in lines {
             guard !line.isEmpty,
                   let data = line.data(using: .utf8),
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let type = json["type"] as? String,
-                  type == "PLANNER_RESPONSE" else {
+                  let type = json["type"] as? String else {
                 continue
             }
 
-            if let c = json["content"] as? String {
-                contentChars += c.count
-            }
-            if let t = json["thinking"] as? String {
-                thinkingChars += t.count
+            if type == "PLANNER_RESPONSE" {
+                if let c = json["content"] as? String {
+                    contentChars += c.count
+                }
+                if let t = json["thinking"] as? String {
+                    thinkingChars += t.count
+                }
+            } else {
+                if let c = json["content"] as? String {
+                    otherChars += c.count
+                }
             }
         }
 
         let contentTokens = Int(round(Double(contentChars) / charsPerToken))
         let thinkingTokens = Int(round(Double(thinkingChars) / charsPerToken))
-        return (contentTokens + thinkingTokens, contentTokens, thinkingTokens)
+        let fallbackInputTokens = Int(round(Double(otherChars) / charsPerToken)) + 9500
+        return (contentTokens + thinkingTokens, contentTokens, thinkingTokens, fallbackInputTokens)
     }
 
     private func extractTag(from text: String, tag: String) -> String {
