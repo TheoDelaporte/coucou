@@ -32,6 +32,7 @@ enum BotEmote: String, CaseIterable {
 
 struct ApprovalInfo: Sendable {
     var sessionId: String
+    var projectName: String = ""
     var tool: String
     var command: String
 }

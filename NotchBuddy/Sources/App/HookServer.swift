@@ -163,10 +163,14 @@ final class HookServer: @unchecked Sendable {
             }
 
         case "PreToolUse":
-            activeSessionId = sessionId
-            upsertTask(projectName: projectName, cwd: cwd)
-            state.updateTask(id: "integration_claude", state: .working)
-            state.focusId = "integration_claude"
+            if state.pendingApproval == nil || state.pendingApproval?.sessionId == sessionId {
+                activeSessionId = sessionId
+                upsertTask(projectName: projectName, cwd: cwd)
+                state.focusId = "integration_claude"
+                if state.pendingApproval == nil {
+                    state.updateTask(id: "integration_claude", state: .working)
+                }
+            }
             var tool = payload["tool_name"] as? String
             var input = payload["tool_input"] as? [String: Any]
             if tool == nil, let tc = payload["toolCall"] as? [String: Any] {
@@ -176,15 +180,30 @@ final class HookServer: @unchecked Sendable {
             let step = frenchStep(tool: tool ?? "Tool", input: input ?? [:])
             appendStep(id: "integration_claude", step: step)
             nbLog("PreToolUse \(step)")
-            if state.mode == .hidden {
+            if state.mode == .hidden && state.pendingApproval == nil {
                 NotificationCenter.default.post(name: .hookReveal, object: nil)
             }
 
         case "PostToolUse":
-            state.updateTask(id: "integration_claude", state: .working)
+            if let pending = state.pendingApproval, pending.sessionId == sessionId {
+                state.pendingApproval = nil
+                state.isPinned = false
+                if state.view == .approval {
+                    state.view = state.tasks.isEmpty ? .empty : .overview
+                }
+            }
+            if state.pendingApproval == nil {
+                state.updateTask(id: "integration_claude", state: .working)
+            }
 
         case "PostInvocation":
-            // Intermediate turns do not trigger completion; "Stop" handles the true end of turn
+            if let pending = state.pendingApproval, pending.sessionId == sessionId {
+                state.pendingApproval = nil
+                state.isPinned = false
+                if state.view == .approval {
+                    state.view = state.tasks.isEmpty ? .empty : .overview
+                }
+            }
             break
 
         case "PostToolUseFailure":
@@ -203,6 +222,13 @@ final class HookServer: @unchecked Sendable {
             }
 
         case "Stop":
+            if let pending = state.pendingApproval, pending.sessionId == sessionId {
+                state.pendingApproval = nil
+                state.isPinned = false
+                if state.view == .approval {
+                    state.view = state.tasks.isEmpty ? .empty : .overview
+                }
+            }
             state.updateTask(id: "integration_claude", state: .finished)
             if let message = payload["message"] as? String, !message.isEmpty {
                 appendStep(id: "integration_claude", step: String(message.prefix(60)))
@@ -255,6 +281,9 @@ final class HookServer: @unchecked Sendable {
     @MainActor
     private func expandIfNeeded(to view: IslandView) {
         let state = AppState.shared
+        if state.pendingApproval != nil && view != .approval {
+            return
+        }
         let isAlert: Bool
         switch view {
         case .approval, .finished, .error, .confused: isAlert = true
@@ -338,7 +367,7 @@ final class HookServer: @unchecked Sendable {
 
         upsertTask(projectName: projectName, cwd: cwd)
         state.updateTask(id: "integration_claude", state: .approval)
-        state.pendingApproval = ApprovalInfo(sessionId: sessionId, tool: tool, command: command)
+        state.pendingApproval = ApprovalInfo(sessionId: sessionId, projectName: projectName, tool: tool, command: command)
         state.isPinned = true
         SoundEngine.shared.play("approval")
 
@@ -864,33 +893,64 @@ def main():
             except Exception:
                 pass
 
+    socket_path = os.path.expanduser(
+        '~/Library/Application Support/NotchBuddy/nb.sock'
+    )
+
     tool_call = payload.get('toolCall', {})
     args = tool_call.get('args', {}) if tool_call else {}
     tool_name = tool_call.get('name', '') if tool_call else payload.get('tool_name', '')
     cmd = args.get('CommandLine', '') or payload.get('tool_input', {}).get('command', '')
     target_file = args.get('TargetFile', '') or args.get('AbsolutePath', '')
-    is_bypass = args.get('BypassSandbox') is True
     is_antigravity = 'conversationId' in payload
 
-    # Detection of tools requiring user approval in Antigravity:
+    # Allowed tools cache for Antigravity (persistent Always-Allow)
+    allow_cache_file = os.path.expanduser('~/.gemini/antigravity/coucou_allowed_mcp.json')
+    allowed_tools = set()
+    if os.path.exists(allow_cache_file):
+        try:
+            with open(allow_cache_file, 'r', encoding='utf-8') as f:
+                allowed_tools = set(json.load(f))
+        except Exception:
+            pass
+
+    server_name = args.get('ServerName', '')
+    mcp_tool_name = args.get('ToolName', '')
     is_mcp = (
         tool_name == 'call_mcp_tool' or
-        '/' in tool_name or
         tool_name.startswith('mcp_') or
-        tool_name.startswith('API-') or
-        args.get('ServerName') is not None
+        server_name != ''
     )
-    is_question = tool_name == 'ask_question'
-    needs_approval_antigravity = is_antigravity and event == 'PreToolUse' and (is_bypass or is_mcp or is_question)
+    is_question = (tool_name == 'ask_question')
+    mcp_id = f"{server_name}/{mcp_tool_name}" if (server_name and mcp_tool_name) else (server_name or tool_name)
+
+    # If MCP tool was already marked as Always Allowed by the user in Coucou:
+    if is_antigravity and is_mcp and (mcp_id in allowed_tools or server_name in allowed_tools):
+        sys.stdout.write(json.dumps({'decision': 'allow'}) + '\\n')
+        sys.stdout.flush()
+        payload['hook_event_name'] = 'PreToolUse'
+        payload['tool_name'] = mcp_id
+        payload['tool_input'] = {'command': mcp_id}
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(0.3)
+            s.connect(socket_path)
+            s.sendall((json.dumps(payload) + '\\n').encode())
+            s.close()
+        except Exception:
+            pass
+        sys.exit(0)
+
+    # In Antigravity, only prompt for tools requiring external approval:
+    # 1. MCP tool calls (external integrations: Notion, Serena, Stitch, etc.)
+    # 2. Interactive questions (ask_question)
+    needs_approval_antigravity = is_antigravity and event == 'PreToolUse' and (is_mcp or is_question)
 
     if needs_approval_antigravity:
         payload['hook_event_name'] = 'PermissionRequest'
         if is_mcp:
-            server = args.get('ServerName', '')
-            tname = args.get('ToolName', '')
-            mcp_label = f"{server}/{tname}" if (server and tname) else tool_name
-            payload['tool_name'] = mcp_label
-            payload['tool_input'] = {'command': mcp_label}
+            payload['tool_name'] = mcp_id
+            payload['tool_input'] = {'command': mcp_id}
         elif is_question:
             q_list = args.get('questions', [])
             q_text = q_list[0].get('question', 'Question') if (isinstance(q_list, list) and q_list) else 'Question'
@@ -899,10 +959,6 @@ def main():
         else:
             payload['tool_name'] = tool_name or 'Command'
             payload['tool_input'] = {'command': cmd or target_file or tool_name}
-
-    socket_path = os.path.expanduser(
-        '~/Library/Application Support/NotchBuddy/nb.sock'
-    )
 
     if event == 'PermissionRequest' or needs_approval_antigravity:
         # Blocking approval flow: wait for decision from Coucou (up to 115s)
@@ -926,7 +982,18 @@ def main():
                 except Exception:
                     decision = ''
                 if is_antigravity:
-                    if decision in ('allow', 'always'):
+                    if decision == 'always':
+                        try:
+                            allowed_tools.add(mcp_id)
+                            if server_name:
+                                allowed_tools.add(server_name)
+                            os.makedirs(os.path.dirname(allow_cache_file), exist_ok=True)
+                            with open(allow_cache_file, 'w', encoding='utf-8') as f:
+                                json.dump(list(allowed_tools), f)
+                        except Exception:
+                            pass
+                        out = {'decision': 'allow'}
+                    elif decision == 'allow':
                         out = {'decision': 'allow'}
                     elif decision == 'deny':
                         out = {'decision': 'deny', 'reason': 'Refusé depuis Coucou'}
@@ -969,10 +1036,12 @@ def main():
     except Exception:
         pass  # Always exit cleanly
     # Return valid decision for Antigravity hooks
-    if event == 'PreToolUse':
-        print(json.dumps({'decision': 'allow'}))
+    if is_antigravity and event == 'PreToolUse':
+        # Default decision: ask (lets Antigravity check its internal permissions / cache)
+        sys.stdout.write(json.dumps({'decision': 'ask'}) + '\\n')
     else:
-        print('{}')
+        sys.stdout.write('{}\\n')
+    sys.stdout.flush()
     sys.exit(0)
 
 main()

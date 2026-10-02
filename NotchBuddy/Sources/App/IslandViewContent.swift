@@ -215,7 +215,7 @@ struct ApprovalView: View {
         ZStack {
             CardBackground(wash: .amber)
             VStack(alignment: .leading, spacing: 5) {
-                AgentWho(task: state.focusTask, label: "needs permission")
+                AgentWho(task: state.focusTask, label: "needs permission", overrideName: approval?.projectName)
                 CodeBlock(text: approval?.command ?? approval?.tool ?? "…")
                 HStack(spacing: 8) {
                     SecondaryButton("Deny") {
@@ -2525,13 +2525,14 @@ extension CardBackground where Content == EmptyView {
 struct AgentWho: View {
     let task: AgentTask?
     let label: String
+    var overrideName: String? = nil
 
     var body: some View {
         HStack(spacing: 7) {
-            if let task = task {
-                Circle().fill(Color(hex: task.color)).frame(width: 8, height: 8)
-                Text(task.name).font(.system(size: 12, weight: .semibold)).foregroundColor(Color(hex: "#F5F6F8"))
-            }
+            let displayName = (overrideName?.isEmpty == false) ? overrideName! : (task?.name ?? "Antigravity")
+            let dotColor = task?.color ?? "#F5F6F8"
+            Circle().fill(Color(hex: dotColor)).frame(width: 8, height: 8)
+            Text(displayName).font(.system(size: 12, weight: .semibold)).foregroundColor(Color(hex: "#F5F6F8"))
             Text(label).font(.system(size: 12)).foregroundColor(Color(hex: "#8E939C"))
         }
     }
