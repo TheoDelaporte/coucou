@@ -155,9 +155,9 @@ final class HookServer: @unchecked Sendable {
             if let prompt = payload["prompt"] as? String, !prompt.isEmpty {
                 appendStep(id: "integration_claude", step: String(prompt.prefix(60)))
             } else {
-                appendStep(id: "integration_claude", step: "Prompt…")
+                appendStep(id: "integration_claude", step: "Réflexion…")
             }
-            if state.isPresent { expandIfNeeded(to: .overview) }
+            // Discreet thinking in the notch: do not force expand/reveal
 
         case "PreToolUse":
             activeSessionId = sessionId
@@ -177,17 +177,8 @@ final class HookServer: @unchecked Sendable {
             state.updateTask(id: "integration_claude", state: .working)
 
         case "PostInvocation":
-            state.updateTask(id: "integration_claude", state: .finished)
-            SoundEngine.shared.play("finish")
-            if focused {
-                expandIfNeeded(to: .finished)
-            } else {
-                setPillBadge(id: "integration_claude", badge: .finished)
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5.2) {
-                state.updateTask(id: "integration_claude", state: .idle)
-                self.clearPillBadge(id: "integration_claude")
-            }
+            // Intermediate turns do not trigger completion; "Stop" handles the true end of turn
+            break
 
         case "PostToolUseFailure":
             state.updateTask(id: "integration_claude", state: .working)
@@ -208,6 +199,8 @@ final class HookServer: @unchecked Sendable {
             state.updateTask(id: "integration_claude", state: .finished)
             if let message = payload["message"] as? String, !message.isEmpty {
                 appendStep(id: "integration_claude", step: String(message.prefix(60)))
+            } else {
+                appendStep(id: "integration_claude", step: "Terminé ✓")
             }
             SoundEngine.shared.play("finish")
             if focused {
@@ -563,9 +556,6 @@ final class HookServer: @unchecked Sendable {
             "PreInvocation": [
                 ["type": "command", "command": "\"\(hookPath)\" PreInvocation", "timeout": 10]
             ],
-            "PostInvocation": [
-                ["type": "command", "command": "\"\(hookPath)\" PostInvocation", "timeout": 10]
-            ],
             "PreToolUse": [
                 ["matcher": "*", "hooks": [["type": "command", "command": "\"\(hookPath)\" PreToolUse", "timeout": 10]]]
             ],
@@ -820,6 +810,22 @@ def main():
         else:
             payload['cwd'] = os.getcwd()
 
+    if event == 'PreInvocation' and ('prompt' not in payload or not payload['prompt']):
+        t_path = payload.get('transcriptPath')
+        if t_path and os.path.exists(t_path):
+            try:
+                with open(t_path, 'r', encoding='utf-8') as f:
+                    for line in reversed(f.readlines()):
+                        entry = json.loads(line)
+                        if entry.get('source') == 'USER_EXPLICIT' or entry.get('type') == 'USER_INPUT':
+                            content = entry.get('content', '')
+                            if '<USER_REQUEST>' in content:
+                                content = content.split('<USER_REQUEST>')[1].split('</USER_REQUEST>')[0].strip()
+                            payload['prompt'] = content
+                            break
+            except Exception:
+                pass
+
     socket_path = os.path.expanduser(
         '~/Library/Application Support/NotchBuddy/nb.sock'
     )
@@ -880,8 +886,11 @@ def main():
         s.close()
     except Exception:
         pass  # Always exit cleanly
-    # Return empty valid JSON object on stdout for Antigravity hooks
-    print('{}')
+    # Return valid decision for Antigravity hooks
+    if event == 'PreToolUse':
+        print(json.dumps({'decision': 'allow'}))
+    else:
+        print('{}')
     sys.exit(0)
 
 main()

@@ -16,6 +16,7 @@ DerivedData/
 *.icloud
 
 # Local only (never published)
+.agents/
 .claude/
 _prive/
 task.md
