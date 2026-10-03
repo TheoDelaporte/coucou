@@ -129,8 +129,20 @@ final class HookServer: @unchecked Sendable {
         if cwd.isEmpty, let workspaces = payload["workspacePaths"] as? [String], let first = workspaces.first {
             cwd = first
         }
-        let rawName = URL(fileURLWithPath: cwd).lastPathComponent
-        let projectName = aliasProjectName(rawName.isEmpty ? "Antigravity" : rawName)
+        var projectName: String = "Antigravity"
+        if let workspaces = payload["workspacePaths"] as? [String], let first = workspaces.first, !first.isEmpty {
+            let wsName = URL(fileURLWithPath: first).lastPathComponent
+            if !wsName.isEmpty && !wsName.hasPrefix(".") {
+                projectName = wsName
+            }
+        }
+        if projectName == "Antigravity", !cwd.isEmpty {
+            let raw = URL(fileURLWithPath: cwd).lastPathComponent
+            if !raw.isEmpty && !raw.hasPrefix(".") && raw != "config" && raw != "bin" && raw != "tmp" {
+                projectName = raw
+            }
+        }
+        projectName = aliasProjectName(projectName)
 
         let termProgram = payload["term_program"] as? String ?? ""
         let bundleId    = payload["bundle_id"]    as? String ?? ""
@@ -333,8 +345,20 @@ final class HookServer: @unchecked Sendable {
         if cwd.isEmpty, let workspaces = payload["workspacePaths"] as? [String], let first = workspaces.first {
             cwd = first
         }
-        let rawName = URL(fileURLWithPath: cwd).lastPathComponent
-        let projectName = aliasProjectName(rawName.isEmpty ? "Session" : rawName)
+        var projectName: String = "Antigravity"
+        if let workspaces = payload["workspacePaths"] as? [String], let first = workspaces.first, !first.isEmpty {
+            let wsName = URL(fileURLWithPath: first).lastPathComponent
+            if !wsName.isEmpty && !wsName.hasPrefix(".") {
+                projectName = wsName
+            }
+        }
+        if projectName == "Antigravity", !cwd.isEmpty {
+            let raw = URL(fileURLWithPath: cwd).lastPathComponent
+            if !raw.isEmpty && !raw.hasPrefix(".") && raw != "config" && raw != "bin" && raw != "tmp" {
+                projectName = raw
+            }
+        }
+        projectName = aliasProjectName(projectName)
 
         let termProgram = payload["term_program"] as? String ?? ""
         let bundleId    = payload["bundle_id"]    as? String ?? ""
@@ -351,23 +375,27 @@ final class HookServer: @unchecked Sendable {
             return
         }
 
-        var tool = payload["tool_name"] as? String ?? "Tool"
+        var tool = payload["tool_name"] as? String ?? "Command"
         var command = tool
         if let input = payload["tool_input"] as? [String: Any] {
             command = input["command"] as? String ?? tool
         }
         if let tc = payload["toolCall"] as? [String: Any] {
-            if let name = tc["name"] as? String { tool = name }
             if let args = tc["args"] as? [String: Any] {
-                if let cmd = args["CommandLine"] as? String {
+                if let cmd = args["CommandLine"] as? String, !cmd.isEmpty {
                     command = cmd
-                } else if let target = args["TargetFile"] as? String {
+                } else if let target = args["TargetFile"] as? String, !target.isEmpty {
                     command = target
-                } else if let path = args["AbsolutePath"] as? String {
+                } else if let path = args["AbsolutePath"] as? String, !path.isEmpty {
                     command = path
                 } else if let server = args["ServerName"] as? String, let tname = args["ToolName"] as? String {
                     tool = "\(server)/\(tname)"
                     command = "\(server)/\(tname)"
+                }
+            }
+            if tool == "Command" || tool == "run_command" || tool == "call_mcp_tool" {
+                if let name = tc["name"] as? String, !name.isEmpty {
+                    tool = name
                 }
             }
         }
@@ -935,33 +963,11 @@ def main():
             except Exception:
                 pass
 
-    socket_path = os.path.expanduser(
-        '~/Library/Application Support/NotchBuddy/nb.sock'
-    )
+    socket_dir = os.path.expanduser('~/Library/Application Support/NotchBuddy')
+    socket_path = os.path.join(socket_dir, 'nb.sock')
+    allow_cache_file = os.path.join(socket_dir, 'always_allowed.json')
 
-    tool_call = payload.get('toolCall', {})
-    args = tool_call.get('args', {}) if tool_call else {}
-    tool_name = tool_call.get('name', '') if tool_call else payload.get('tool_name', '')
-    cmd = args.get('CommandLine', '') or payload.get('tool_input', {}).get('command', '')
-    target_file = args.get('TargetFile', '') or args.get('AbsolutePath', '')
-    is_bypass = (args.get('BypassSandbox') is True)
-    is_antigravity = 'conversationId' in payload
-
-    server_name = args.get('ServerName', '')
-    mcp_tool_name = args.get('ToolName', '')
-    is_mcp = (
-        tool_name == 'call_mcp_tool' or
-        tool_name.startswith('mcp_') or
-        server_name != ''
-    )
-    is_question = (tool_name == 'ask_question')
-    mcp_id = f"{server_name}/{mcp_tool_name}" if (server_name and mcp_tool_name) else (server_name or tool_name)
-    action_label = tool_call.get('toolAction') or args.get('toolAction') or ''
-
-    import re, shlex
-
-    # Cache file for Always-Allowed items
-    allow_cache_file = os.path.expanduser('~/.gemini/antigravity/coucou_always_allowed.json')
+    # Load Always-Allowed items
     allowed_items = set()
     if os.path.exists(allow_cache_file):
         try:
@@ -970,26 +976,45 @@ def main():
         except Exception:
             pass
 
-    SAFE_BINARIES = {
-        'cat', 'echo', 'printf', 'touch', 'mkdir', 'cp', 'mv', 'rm', 'ls', 'pwd',
-        'grep', 'egrep', 'fgrep', 'find', 'sed', 'awk', 'head', 'tail', 'wc', 'sort', 'uniq',
-        'git', 'python', 'python3', 'node', 'npm', 'npx', 'yarn', 'pnpm', 'bun',
-        'cargo', 'rustc', 'swift', 'xcodebuild', 'swiftc', 'pip', 'pip3',
-        'pytest', 'tsc', 'go', 'make', 'which', 'where', 'env', 'diff',
-        'sleep', 'true', 'false', 'test', '[', 'basename', 'dirname', 'readlink',
-        'cut', 'tr', 'tee', 'tar', 'unzip', 'zip', 'gzip', 'gunzip', 'file',
-        'sips', 'qlmanage', 'chmod', 'jq', 'date'
-    }
+    tool_call = payload.get('toolCall', {})
+    args = tool_call.get('args', {}) if tool_call else {}
+    tool_name = tool_call.get('name', '') if tool_call else payload.get('tool_name', '')
+    cmd = args.get('CommandLine', '') or payload.get('tool_input', {}).get('command', '')
+    target_file = args.get('TargetFile', '') or args.get('AbsolutePath', '')
+    is_bypass = (args.get('BypassSandbox') is True)
+    is_antigravity = 'conversationId' in payload
+    action_label = tool_call.get('toolAction') or args.get('toolAction') or ''
 
-    DANGEROUS_BINARIES = {
-        'killall', 'pkill', 'shutdown', 'reboot', 'kill', 'launchctl', 'defaults',
-        'curl', 'wget', 'ssh', 'scp', 'rsync', 'nc', 'ncat', 'netcat', 'telnet', 'ftp',
-        'dd', 'mkfs', 'fdisk'
-    }
+    import re, shlex
 
-    def get_command_info(cmd_str):
+    server_name = args.get('ServerName', '')
+    mcp_tool_name = args.get('ToolName', '')
+    is_mcp = (
+        tool_name == 'call_mcp_tool' or
+        tool_name.startswith('mcp_') or
+        server_name != ''
+    )
+    mcp_id = f"{server_name}/{mcp_tool_name}" if (server_name and mcp_tool_name) else (server_name or tool_name)
+
+    # Safe internal MCP servers that never need user approval prompts
+    SAFE_MCP_SERVERS = {'serena', 'context7'}
+
+    is_external_mcp = False
+    if is_mcp:
+        srv_lower = server_name.lower()
+        if srv_lower:
+            if srv_lower not in SAFE_MCP_SERVERS:
+                is_external_mcp = True
+        elif tool_name.startswith('API-'): # Notion tools
+            is_external_mcp = True
+        elif tool_name.startswith('mcp_'):
+            is_safe_srv = any(tool_name.startswith(f'mcp_{s}') for s in SAFE_MCP_SERVERS)
+            if not is_safe_srv:
+                is_external_mcp = True
+
+    def parse_command(cmd_str):
         if not cmd_str:
-            return '', ''
+            return '', '', ''
         cmd_str = cmd_str.strip()
         tokens = []
         try:
@@ -997,54 +1022,66 @@ def main():
         except Exception:
             tokens = cmd_str.split()
         if not tokens:
-            return '', ''
-        if 'sudo' in tokens:
-            return 'sudo', 'sudo'
+            return '', '', ''
         idx = 0
-        while idx < len(tokens) and tokens[idx] in ('env', 'sh', 'bash', 'zsh', 'time'):
+        while idx < len(tokens) and tokens[idx] in ('sudo', 'env', 'time'):
             idx += 1
-            if idx < len(tokens) and tokens[idx - 1] in ('sh', 'bash', 'zsh') and tokens[idx] == '-c':
-                idx += 1
-                if idx < len(tokens):
-                    return get_command_info(tokens[idx])
+        if idx < len(tokens) and tokens[idx] in ('sh', 'bash', 'zsh') and idx + 1 < len(tokens) and tokens[idx + 1] == '-c':
+            idx += 2
+            if idx < len(tokens):
+                return parse_command(tokens[idx])
         if idx < len(tokens):
             full_bin = tokens[idx]
             base_name = os.path.basename(full_bin)
-            return full_bin, base_name
-        return '', ''
+            subcommand = tokens[idx + 1] if idx + 1 < len(tokens) and not tokens[idx + 1].startswith('-') else ''
+            cmd_prefix = f"{base_name} {subcommand}".strip()
+            return full_bin, base_name, cmd_prefix
+        return '', '', ''
 
-    def is_safe_command(cmd_str):
+    def is_critical_system_command(cmd_str):
         if not cmd_str:
-            return True
-        if '/Applications/' in cmd_str or '/System/' in cmd_str or '/Library/' in cmd_str:
             return False
-        subcmds = [p.strip() for p in cmd_str.replace('&&', ';').replace('||', ';').replace('|', ';').split(';') if p.strip()]
-        for sub in subcmds:
-            full_bin, base_name = get_command_info(sub)
-            if not base_name:
-                continue
-            if base_name in DANGEROUS_BINARIES or full_bin in DANGEROUS_BINARIES:
-                return False
-            if base_name not in SAFE_BINARIES:
-                return False
-        return True
+        clean = " " + cmd_str.strip() + " "
+        destructive = [
+            " rm -rf /", " rm -fr /", " rm -rf ~", " rm -fr ~",
+            " dd if=", " mkfs", " shutdown", " reboot", " sudo "
+        ]
+        for term in destructive:
+            if term in clean:
+                return True
+        return False
 
-    full_bin, base_name = get_command_info(cmd)
+    full_bin, base_name, cmd_prefix = parse_command(cmd)
 
-    # Check if tool or binary is already always-allowed:
+    # In Antigravity:
+    # 1. BypassSandbox: true ALWAYS requires approval unless already in always_allowed
+    # 2. Critical destructive system commands require approval even in sandbox
+    # 3. External MCP tools (e.g. Notion) require approval
+    # Normal workspace dev commands (git, npm, python, etc.) running sandboxed NEVER prompt!
+    needs_approval_antigravity = False
+    if is_antigravity and event == 'PreToolUse':
+        if tool_name == 'run_command':
+            if is_bypass:
+                needs_approval_antigravity = True
+            elif is_critical_system_command(cmd):
+                needs_approval_antigravity = True
+        elif is_external_mcp:
+            needs_approval_antigravity = True
+
+    # Check if tool, binary, or command prefix is already always-allowed:
     is_always_allowed = False
-    if is_antigravity:
-        if is_mcp and (mcp_id in allowed_items or server_name in allowed_items):
+    if is_antigravity and needs_approval_antigravity:
+        if is_external_mcp and (mcp_id in allowed_items or server_name in allowed_items):
             is_always_allowed = True
-        elif full_bin and (full_bin in allowed_items or base_name in allowed_items):
-            is_always_allowed = True
+        elif tool_name == 'run_command':
+            if base_name in allowed_items or full_bin in allowed_items or cmd_prefix in allowed_items:
+                is_always_allowed = True
 
     if is_always_allowed:
         out = {'decision': 'allow'}
         if full_bin:
             out['permissionOverrides'] = [f"command({full_bin})"]
-        sys.stdout.write(json.dumps(out) + '\\n')
-        sys.stdout.flush()
+        print(json.dumps(out), flush=True)
         payload['hook_event_name'] = 'PreToolUse'
         payload['tool_name'] = tool_name
         payload['tool_input'] = {'command': cmd or target_file or tool_name}
@@ -1052,38 +1089,20 @@ def main():
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(0.3)
             s.connect(socket_path)
-            s.sendall((json.dumps(payload) + '\\n').encode())
+            s.sendall(json.dumps(payload).encode() + bytes([10]))
             s.close()
         except Exception:
             pass
         sys.exit(0)
 
-    # In Antigravity:
-    # 1. MCP tool calls (Notion, Serena, Stitch, etc.)
-    # 2. Interactive questions (ask_question)
-    # 3. Unsafe commands: external apps (/Applications/...), network (curl...), or bypass sandbox commands not in safe list
-    # Normal workspace commands (cat, git, python, etc.) are NEVER prompted!
-    is_unsafe_command = False
-    if tool_name == 'run_command':
-        if not is_safe_command(cmd):
-            is_unsafe_command = True
-        elif is_bypass and not is_safe_command(cmd):
-            is_unsafe_command = True
-
-    needs_approval_antigravity = is_antigravity and event == 'PreToolUse' and (is_unsafe_command or is_mcp or is_question)
-
     if needs_approval_antigravity:
         payload['hook_event_name'] = 'PermissionRequest'
-        if is_mcp:
+        if is_external_mcp:
             payload['tool_name'] = mcp_id
             payload['tool_input'] = {'command': mcp_id}
-        elif is_question:
-            q_list = args.get('questions', [])
-            q_text = q_list[0].get('question', 'Question') if (isinstance(q_list, list) and q_list) else 'Question'
-            payload['tool_name'] = 'Question'
-            payload['tool_input'] = {'command': q_text}
         else:
-            payload['tool_name'] = action_label or base_name or 'Command'
+            label = action_label or (f"Bypass: {cmd_prefix}" if is_bypass else (cmd_prefix or base_name or 'Command'))
+            payload['tool_name'] = label
             payload['tool_input'] = {'command': cmd or target_file or tool_name}
 
     if event == 'PermissionRequest' or needs_approval_antigravity:
@@ -1092,13 +1111,13 @@ def main():
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(115)
             s.connect(socket_path)
-            s.sendall((json.dumps(payload) + '\\n').encode())
+            s.sendall(json.dumps(payload).encode() + bytes([10]))
             chunks = []
             while True:
                 chunk = s.recv(4096)
                 if not chunk: break
                 chunks.append(chunk)
-                if b'\\n' in chunk: break
+                if 10 in chunk: break
             s.close()
             response = b''.join(chunks).decode().strip()
             if response:
@@ -1110,17 +1129,20 @@ def main():
                 if is_antigravity:
                     if decision == 'always':
                         try:
-                            if is_mcp:
+                            if is_external_mcp:
                                 allowed_items.add(mcp_id)
                                 if server_name:
                                     allowed_items.add(server_name)
-                            elif full_bin:
-                                allowed_items.add(full_bin)
+                            elif tool_name == 'run_command':
+                                if cmd_prefix:
+                                    allowed_items.add(cmd_prefix)
                                 if base_name:
                                     allowed_items.add(base_name)
+                                if full_bin:
+                                    allowed_items.add(full_bin)
                             os.makedirs(os.path.dirname(allow_cache_file), exist_ok=True)
                             with open(allow_cache_file, 'w', encoding='utf-8') as f:
-                                json.dump(list(allowed_items), f)
+                                json.dump(list(allowed_items), f, indent=2)
                         except Exception:
                             pass
                         out = {'decision': 'allow'}
@@ -1131,34 +1153,29 @@ def main():
                         if full_bin:
                             out['permissionOverrides'] = [f"command({full_bin})"]
                     elif decision == 'deny':
-                        out = {'decision': 'deny', 'reason': 'Refusé depuis Coucou'}
+                        out = {'decision': 'deny', 'reason': "Refusé par l'utilisateur depuis Coucou"}
                     else:
                         out = {'decision': 'ask'}
-                    sys.stdout.write(json.dumps(out) + '\\n')
-                    sys.stdout.flush()
+                    print(json.dumps(out), flush=True)
                     sys.exit(0)
                 else:
                     if decision == 'allow':
                         out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow'}}}
-                        sys.stdout.write(json.dumps(out) + '\\n')
-                        sys.stdout.flush()
+                        print(json.dumps(out), flush=True)
                         sys.exit(0)
                     elif decision == 'always':
                         suggestions = payload.get('permission_suggestions', [])
                         out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow', 'updatedPermissions': suggestions}}}
-                        sys.stdout.write(json.dumps(out) + '\\n')
-                        sys.stdout.flush()
+                        print(json.dumps(out), flush=True)
                         sys.exit(0)
                     elif decision == 'deny':
                         out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'deny', 'message': 'Denied from Coucou'}}}
-                        sys.stdout.write(json.dumps(out) + '\\n')
-                        sys.stdout.flush()
+                        print(json.dumps(out), flush=True)
                         sys.exit(0)
         except Exception:
             pass
         if is_antigravity:
-            sys.stdout.write(json.dumps({'decision': 'ask'}) + '\\n')
-            sys.stdout.flush()
+            print(json.dumps({'decision': 'ask'}), flush=True)
         sys.exit(0)
 
     # All other events: fire-and-forget (0.3s timeout, never blocks)
@@ -1166,7 +1183,7 @@ def main():
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(0.3)
         s.connect(socket_path)
-        s.sendall((json.dumps(payload) + '\\n').encode())
+        s.sendall(json.dumps(payload).encode() + bytes([10]))
         s.close()
     except Exception:
         pass  # Always exit cleanly
@@ -1177,10 +1194,9 @@ def main():
         out = {'decision': 'allow'}
         if full_bin:
             out['permissionOverrides'] = [f"command({full_bin})"]
-        sys.stdout.write(json.dumps(out) + '\\n')
+        print(json.dumps(out), flush=True)
     else:
-        sys.stdout.write('{}\\n')
-    sys.stdout.flush()
+        print('{}', flush=True)
     sys.exit(0)
 
 main()

@@ -380,12 +380,47 @@ final class IslandWindowController: NSWindowController {
         keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             Task { @MainActor in
                 guard let self = self else { return }
+                if self.state.view == .approval && self.state.pendingApproval != nil {
+                    let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
+                    if event.keyCode == 53 || chars == "n" { // Escape or N -> Deny
+                        HookServer.shared.sendApprovalDecision("deny")
+                        return
+                    }
+                    if event.keyCode == 36 || chars == "y" { // Return or Y -> Allow
+                        HookServer.shared.sendApprovalDecision("allow")
+                        return
+                    }
+                    if chars == "a" { // A -> Always
+                        HookServer.shared.sendApprovalDecision("always")
+                        return
+                    }
+                }
                 if event.keyCode == 53 { // Escape
                     if self.state.mode == .expanded && !self.state.isPinned {
                         self.collapse()
                     }
                 }
             }
+        }
+
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self else { return event }
+            if self.state.view == .approval && self.state.pendingApproval != nil {
+                let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
+                if event.keyCode == 53 || chars == "n" {
+                    HookServer.shared.sendApprovalDecision("deny")
+                    return nil
+                }
+                if event.keyCode == 36 || chars == "y" {
+                    HookServer.shared.sendApprovalDecision("allow")
+                    return nil
+                }
+                if chars == "a" {
+                    HookServer.shared.sendApprovalDecision("always")
+                    return nil
+                }
+            }
+            return event
         }
 
         // Hook server expand requests (alerts only)
