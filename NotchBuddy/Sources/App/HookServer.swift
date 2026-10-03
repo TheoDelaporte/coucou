@@ -958,6 +958,8 @@ def main():
     mcp_id = f"{server_name}/{mcp_tool_name}" if (server_name and mcp_tool_name) else (server_name or tool_name)
     action_label = tool_call.get('toolAction') or args.get('toolAction') or ''
 
+    import re, shlex
+
     # Cache file for Always-Allowed items
     allow_cache_file = os.path.expanduser('~/.gemini/antigravity/coucou_always_allowed.json')
     allowed_items = set()
@@ -968,18 +970,80 @@ def main():
         except Exception:
             pass
 
-    cmd_prefix = ''
-    if cmd:
-        cmd_clean = cmd.strip()
-        cmd_prefix = cmd_clean.split()[0] if cmd_clean else ''
-    # Check if tool or MCP server is already always-allowed:
+    SAFE_BINARIES = {
+        'cat', 'echo', 'printf', 'touch', 'mkdir', 'cp', 'mv', 'rm', 'ls', 'pwd',
+        'grep', 'egrep', 'fgrep', 'find', 'sed', 'awk', 'head', 'tail', 'wc', 'sort', 'uniq',
+        'git', 'python', 'python3', 'node', 'npm', 'npx', 'yarn', 'pnpm', 'bun',
+        'cargo', 'rustc', 'swift', 'xcodebuild', 'swiftc', 'pip', 'pip3',
+        'pytest', 'tsc', 'go', 'make', 'which', 'where', 'env', 'diff',
+        'sleep', 'true', 'false', 'test', '[', 'basename', 'dirname', 'readlink',
+        'cut', 'tr', 'tee', 'tar', 'unzip', 'zip', 'gzip', 'gunzip', 'file',
+        'sips', 'qlmanage', 'chmod', 'jq', 'date'
+    }
+
+    DANGEROUS_BINARIES = {
+        'killall', 'pkill', 'shutdown', 'reboot', 'kill', 'launchctl', 'defaults',
+        'curl', 'wget', 'ssh', 'scp', 'rsync', 'nc', 'ncat', 'netcat', 'telnet', 'ftp',
+        'dd', 'mkfs', 'fdisk'
+    }
+
+    def get_command_info(cmd_str):
+        if not cmd_str:
+            return '', ''
+        cmd_str = cmd_str.strip()
+        tokens = []
+        try:
+            tokens = shlex.split(cmd_str)
+        except Exception:
+            tokens = cmd_str.split()
+        if not tokens:
+            return '', ''
+        if 'sudo' in tokens:
+            return 'sudo', 'sudo'
+        idx = 0
+        while idx < len(tokens) and tokens[idx] in ('env', 'sh', 'bash', 'zsh', 'time'):
+            idx += 1
+            if idx < len(tokens) and tokens[idx - 1] in ('sh', 'bash', 'zsh') and tokens[idx] == '-c':
+                idx += 1
+                if idx < len(tokens):
+                    return get_command_info(tokens[idx])
+        if idx < len(tokens):
+            full_bin = tokens[idx]
+            base_name = os.path.basename(full_bin)
+            return full_bin, base_name
+        return '', ''
+
+    def is_safe_command(cmd_str):
+        if not cmd_str:
+            return True
+        if '/Applications/' in cmd_str or '/System/' in cmd_str or '/Library/' in cmd_str:
+            return False
+        subcmds = [p.strip() for p in cmd_str.replace('&&', ';').replace('||', ';').replace('|', ';').split(';') if p.strip()]
+        for sub in subcmds:
+            full_bin, base_name = get_command_info(sub)
+            if not base_name:
+                continue
+            if base_name in DANGEROUS_BINARIES or full_bin in DANGEROUS_BINARIES:
+                return False
+            if base_name not in SAFE_BINARIES:
+                return False
+        return True
+
+    full_bin, base_name = get_command_info(cmd)
+
+    # Check if tool or binary is already always-allowed:
     is_always_allowed = False
     if is_antigravity:
         if is_mcp and (mcp_id in allowed_items or server_name in allowed_items):
             is_always_allowed = True
+        elif full_bin and (full_bin in allowed_items or base_name in allowed_items):
+            is_always_allowed = True
 
     if is_always_allowed:
-        sys.stdout.write(json.dumps({'decision': 'allow'}) + '\\n')
+        out = {'decision': 'allow'}
+        if full_bin:
+            out['permissionOverrides'] = [f"command({full_bin})"]
+        sys.stdout.write(json.dumps(out) + '\\n')
         sys.stdout.flush()
         payload['hook_event_name'] = 'PreToolUse'
         payload['tool_name'] = tool_name
@@ -994,11 +1058,19 @@ def main():
             pass
         sys.exit(0)
 
-    # In Antigravity, only prompt for tools requiring external approval:
-    # 1. MCP tool calls (external services: Notion, Serena, Stitch, etc.)
+    # In Antigravity:
+    # 1. MCP tool calls (Notion, Serena, Stitch, etc.)
     # 2. Interactive questions (ask_question)
-    # NEVER prompt for normal local commands (run_command, cat, git, python, etc.)!
-    needs_approval_antigravity = is_antigravity and event == 'PreToolUse' and (is_mcp or is_question)
+    # 3. Unsafe commands: external apps (/Applications/...), network (curl...), or bypass sandbox commands not in safe list
+    # Normal workspace commands (cat, git, python, etc.) are NEVER prompted!
+    is_unsafe_command = False
+    if tool_name == 'run_command':
+        if not is_safe_command(cmd):
+            is_unsafe_command = True
+        elif is_bypass and not is_safe_command(cmd):
+            is_unsafe_command = True
+
+    needs_approval_antigravity = is_antigravity and event == 'PreToolUse' and (is_unsafe_command or is_mcp or is_question)
 
     if needs_approval_antigravity:
         payload['hook_event_name'] = 'PermissionRequest'
@@ -1011,7 +1083,7 @@ def main():
             payload['tool_name'] = 'Question'
             payload['tool_input'] = {'command': q_text}
         else:
-            payload['tool_name'] = action_label or tool_name or 'Command'
+            payload['tool_name'] = action_label or base_name or 'Command'
             payload['tool_input'] = {'command': cmd or target_file or tool_name}
 
     if event == 'PermissionRequest' or needs_approval_antigravity:
@@ -1042,14 +1114,22 @@ def main():
                                 allowed_items.add(mcp_id)
                                 if server_name:
                                     allowed_items.add(server_name)
+                            elif full_bin:
+                                allowed_items.add(full_bin)
+                                if base_name:
+                                    allowed_items.add(base_name)
                             os.makedirs(os.path.dirname(allow_cache_file), exist_ok=True)
                             with open(allow_cache_file, 'w', encoding='utf-8') as f:
                                 json.dump(list(allowed_items), f)
                         except Exception:
                             pass
                         out = {'decision': 'allow'}
+                        if full_bin:
+                            out['permissionOverrides'] = [f"command({full_bin})"]
                     elif decision == 'allow':
                         out = {'decision': 'allow'}
+                        if full_bin:
+                            out['permissionOverrides'] = [f"command({full_bin})"]
                     elif decision == 'deny':
                         out = {'decision': 'deny', 'reason': 'Refusé depuis Coucou'}
                     else:
@@ -1094,7 +1174,10 @@ def main():
     # Safe/normal tools (run_command, view_file, write_to_file, etc.) are allowed directly
     # so Antigravity executes without any annoying/unnecessary prompts!
     if is_antigravity and event == 'PreToolUse':
-        sys.stdout.write(json.dumps({'decision': 'allow'}) + '\\n')
+        out = {'decision': 'allow'}
+        if full_bin:
+            out['permissionOverrides'] = [f"command({full_bin})"]
+        sys.stdout.write(json.dumps(out) + '\\n')
     else:
         sys.stdout.write('{}\\n')
     sys.stdout.flush()
