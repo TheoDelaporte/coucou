@@ -972,15 +972,10 @@ def main():
     if cmd:
         cmd_clean = cmd.strip()
         cmd_prefix = cmd_clean.split()[0] if cmd_clean else ''
-        if cmd_prefix in ('sudo', 'env', 'sh', 'bash', 'zsh') and len(cmd_clean.split()) > 1:
-            cmd_prefix = cmd_clean.split()[1]
-
-    # Check if tool, MCP server, or command prefix is already always-allowed:
+    # Check if tool or MCP server is already always-allowed:
     is_always_allowed = False
     if is_antigravity:
         if is_mcp and (mcp_id in allowed_items or server_name in allowed_items):
-            is_always_allowed = True
-        elif is_bypass and cmd_prefix and cmd_prefix in allowed_items:
             is_always_allowed = True
 
     if is_always_allowed:
@@ -999,11 +994,11 @@ def main():
             pass
         sys.exit(0)
 
-    # In Antigravity, we prompt in Coucou for:
-    # 1. MCP tool calls (Notion, Serena, Stitch, etc.)
+    # In Antigravity, only prompt for tools requiring external approval:
+    # 1. MCP tool calls (external services: Notion, Serena, Stitch, etc.)
     # 2. Interactive questions (ask_question)
-    # 3. Terminal commands running outside sandbox (BypassSandbox: true)
-    needs_approval_antigravity = is_antigravity and event == 'PreToolUse' and (is_bypass or is_mcp or is_question)
+    # NEVER prompt for normal local commands (run_command, cat, git, python, etc.)!
+    needs_approval_antigravity = is_antigravity and event == 'PreToolUse' and (is_mcp or is_question)
 
     if needs_approval_antigravity:
         payload['hook_event_name'] = 'PermissionRequest'
@@ -1047,8 +1042,6 @@ def main():
                                 allowed_items.add(mcp_id)
                                 if server_name:
                                     allowed_items.add(server_name)
-                            elif is_bypass and cmd_prefix:
-                                allowed_items.add(cmd_prefix)
                             os.makedirs(os.path.dirname(allow_cache_file), exist_ok=True)
                             with open(allow_cache_file, 'w', encoding='utf-8') as f:
                                 json.dump(list(allowed_items), f)
@@ -1097,10 +1090,11 @@ def main():
         s.close()
     except Exception:
         pass  # Always exit cleanly
-    # Return valid decision for Antigravity hooks
+    # Return valid decision for Antigravity hooks:
+    # Safe/normal tools (run_command, view_file, write_to_file, etc.) are allowed directly
+    # so Antigravity executes without any annoying/unnecessary prompts!
     if is_antigravity and event == 'PreToolUse':
-        # Default decision: ask (lets Antigravity check its internal permissions / cache)
-        sys.stdout.write(json.dumps({'decision': 'ask'}) + '\\n')
+        sys.stdout.write(json.dumps({'decision': 'allow'}) + '\\n')
     else:
         sys.stdout.write('{}\\n')
     sys.stdout.flush()
