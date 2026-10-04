@@ -199,6 +199,9 @@ final class HookServer: @unchecked Sendable {
             let step = frenchStep(tool: tool ?? "Tool", input: input ?? [:])
             appendStep(id: "integration_claude", step: step)
             nbLog("PreToolUse \(step)")
+            if tool == "ask_question" || (payload["toolCall"] as? [String: Any])?["name"] as? String == "ask_question" {
+                state.updateTask(id: "integration_claude", state: .question)
+            }
             if state.mode == .hidden && state.pendingApproval == nil {
                 NotificationCenter.default.post(name: .hookReveal, object: nil)
             }
@@ -697,7 +700,7 @@ final class HookServer: @unchecked Sendable {
                 ["type": "command", "command": "\"\(hookPath)\" PreInvocation", "timeout": 10]
             ],
             "PreToolUse": [
-                ["matcher": "*", "hooks": [["type": "command", "command": "\"\(hookPath)\" PreToolUse", "timeout": 120]]]
+                ["matcher": "*", "hooks": [["type": "command", "command": "\"\(hookPath)\" PreToolUse", "timeout": 10]]]
             ],
             "PostToolUse": [
                 ["matcher": "*", "hooks": [["type": "command", "command": "\"\(hookPath)\" PostToolUse", "timeout": 10]]]
@@ -958,269 +961,18 @@ def main():
             except Exception:
                 pass
 
+    is_antigravity = ('conversationId' in payload)
+
     socket_dir = os.path.expanduser('~/Library/Application Support/NotchBuddy')
     socket_path = os.path.join(socket_dir, 'nb.sock')
-    allow_cache_file = os.path.join(socket_dir, 'always_allowed.json')
 
-    # Load Always-Allowed items from both local cache and Antigravity native config.json
-    allowed_items = set()
-    if os.path.exists(allow_cache_file):
-        try:
-            with open(allow_cache_file, 'r', encoding='utf-8') as f:
-                allowed_items = set(json.load(f))
-        except Exception:
-            pass
-
-    ag_config_file = os.path.expanduser('~/.gemini/config/config.json')
-    ag_grants = set()
-    if os.path.exists(ag_config_file):
-        try:
-            with open(ag_config_file, 'r', encoding='utf-8') as f:
-                ag_data = json.load(f)
-            ag_grants = set(ag_data.get('userSettings', {}).get('globalPermissionGrants', {}).get('allow', []))
-        except Exception:
-            pass
-
-    def persist_antigravity_grant(grants_to_add):
-        if not grants_to_add or not os.path.exists(ag_config_file):
-            return
-        try:
-            with open(ag_config_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            us = data.setdefault('userSettings', {})
-            gpg = us.setdefault('globalPermissionGrants', {})
-            allow_list = gpg.setdefault('allow', [])
-            changed = False
-            for g in grants_to_add:
-                if g and g not in allow_list:
-                    allow_list.append(g)
-                    changed = True
-            if changed:
-                tmp_file = ag_config_file + '.tmp'
-                with open(tmp_file, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, indent=2)
-                os.replace(tmp_file, ag_config_file)
-        except Exception:
-            pass
-
-    tool_call = payload.get('toolCall', {})
-    args = tool_call.get('args', {}) if tool_call else {}
-    tool_name = tool_call.get('name', '') if tool_call else payload.get('tool_name', '')
-    cmd = args.get('CommandLine', '') or payload.get('tool_input', {}).get('command', '')
-    target_file = args.get('TargetFile', '') or args.get('AbsolutePath', '')
-    is_bypass = (args.get('BypassSandbox') is True)
-    is_antigravity = 'conversationId' in payload
-    action_label = tool_call.get('toolAction') or args.get('toolAction') or ''
-
-    import re, shlex
-
-
-    def parse_command(cmd_str):
-        if not cmd_str:
-            return '', '', ''
-        cmd_str = cmd_str.strip()
-        tokens = []
-        try:
-            tokens = shlex.split(cmd_str)
-        except Exception:
-            tokens = cmd_str.split()
-        if not tokens:
-            return '', '', ''
-        idx = 0
-        while idx < len(tokens) and tokens[idx] in ('sudo', 'env', 'time'):
-            idx += 1
-        if idx < len(tokens) and tokens[idx] in ('sh', 'bash', 'zsh') and idx + 1 < len(tokens) and tokens[idx + 1] == '-c':
-            idx += 2
-            if idx < len(tokens):
-                return parse_command(tokens[idx])
-        if idx < len(tokens):
-            full_bin = tokens[idx]
-            base_name = os.path.basename(full_bin)
-            subcommand = tokens[idx + 1] if idx + 1 < len(tokens) and not tokens[idx + 1].startswith('-') else ''
-            cmd_prefix = f"{base_name} {subcommand}".strip()
-            return full_bin, base_name, cmd_prefix
-        return '', '', ''
-
-    def is_critical_system_command(cmd_str):
-        if not cmd_str:
-            return False
-        clean = " " + cmd_str.strip() + " "
-        destructive = [
-            " rm -rf /", " rm -fr /", " rm -rf ~", " rm -fr ~",
-            " dd if=", " mkfs", " shutdown", " reboot", " sudo ",
-            " git push -f", " git push --force", " git reset --hard "
-        ]
-        for term in destructive:
-            if term in clean:
-                return True
-        return False
-
-    def build_overrides(bin_name, cmd_text, file_path="", tname="", is_byp=False, host="", mcp_serv="", mcp_tname=""):
-        res = []
-        if bin_name:
-            res.append(f"command({bin_name})")
-            if is_byp:
-                res.append(f"unsandboxed({bin_name})")
-        if cmd_text:
-            cleaned = cmd_text.strip()
-            if cleaned and cleaned != bin_name:
-                res.append(f"command({cleaned})")
-                if is_byp:
-                    res.append(f"unsandboxed({cleaned})")
-        if file_path:
-            p_real = os.path.realpath(os.path.expanduser(file_path))
-            prefix = "read_file" if tname == "view_file" else "write_file"
-            res.append(f"{prefix}({file_path})")
-            if p_real != file_path:
-                res.append(f"{prefix}({p_real})")
-            res.append(f"file({file_path})")
-            res.append(f"path({file_path})")
-        if host:
-            res.append(f"network({host})")
-        if mcp_serv:
-            res.append(f"mcp({mcp_serv})")
-            if mcp_tname:
-                res.append(f"mcp({mcp_serv}/{mcp_tname})")
-        return res
-
-    def is_out_of_workspace(path, workspace_paths):
-        if not path:
-            return False
-        p = os.path.realpath(os.path.expanduser(path))
-        for ign in ('/.gemini/antigravity/brain/', '/tmp/', '/var/folders/', '/private/tmp/'):
-            if ign in p:
-                return False
-        if not workspace_paths:
-            return False
-        for ws in workspace_paths:
-            real_ws = os.path.realpath(os.path.expanduser(ws))
-            if p == real_ws or p.startswith(real_ws + os.sep):
-                return False
-        return True
-
-    full_bin, base_name, cmd_prefix = parse_command(cmd)
-
-    url = args.get('Url', '')
-    url_host = ''
-    if url:
-        try:
-            from urllib.parse import urlparse
-            url_host = urlparse(url).netloc or url
-        except Exception:
-            url_host = url
-
-    mcp_server = args.get('ServerName', '')
-    mcp_tool = args.get('ToolName', '')
-
-    SAFE_COMMAND_BINARIES = {
-        'echo', 'printf', 'cat', 'head', 'tail', 'wc', 'grep', 'egrep', 'fgrep',
-        'awk', 'sed', 'sort', 'uniq', 'diff', 'pwd', 'which', 'basename',
-        'dirname', 'readlink', 'file', 'date', 'jq', 'test', 'true', 'false',
-        'sleep', 'ls'
-    }
-
-    # In Antigravity:
-    # 1. Critical destructive system commands (sudo, rm -rf /, git push -f...) ALWAYS prompt.
-    # 2. BypassSandbox on non-safe commands (curl, docker, terraform...) prompts in Notch.
-    # 3. File read/write outside workspace (e.g. ~/Library/...) prompts in Notch.
-    # 4. Network requests to non-allowed domains prompt in Notch.
-    # 5. MCP tool calls to non-allowed tools prompt in Notch.
-    # 6. Normal workspace dev commands running sandboxed NEVER prompt.
-    # 7. Harmless shell utils (echo, cat, ls...) NEVER prompt even with BypassSandbox.
-    needs_approval_antigravity = False
-    approval_label = ''
-    approval_cmd = ''
-
-    if is_antigravity and event == 'PreToolUse':
-        if tool_name == 'run_command':
-            if is_critical_system_command(cmd):
-                needs_approval_antigravity = True
-                approval_label = f"Destructive: {cmd_prefix or base_name}"
-                approval_cmd = cmd
-            elif is_bypass and base_name not in SAFE_COMMAND_BINARIES:
-                needs_approval_antigravity = True
-                approval_label = f"Bypass: {cmd_prefix or base_name}"
-                approval_cmd = cmd
-        elif tool_name in ('view_file', 'write_to_file', 'replace_file_content'):
-            if is_out_of_workspace(target_file, payload.get('workspacePaths', [])):
-                needs_approval_antigravity = True
-                action_kind = 'Read' if tool_name == 'view_file' else 'Write'
-                file_base = os.path.basename(target_file)
-                approval_label = f"{action_kind}: {file_base}"
-                approval_cmd = target_file
-        elif tool_name == 'read_url_content' and url:
-            net_checks = {url, url_host, f"network({url_host})", f"network({url})"}
-            if not any(nc in allowed_items or nc in ag_grants for nc in net_checks):
-                needs_approval_antigravity = True
-                approval_label = f"Network: {url_host}"
-                approval_cmd = url
-        elif tool_name == 'call_mcp_tool' and mcp_server:
-            mcp_checks = {mcp_server, f"{mcp_server}/{mcp_tool}", f"mcp({mcp_server})", f"mcp({mcp_server}/{mcp_tool})"}
-            if not any(mc in allowed_items or mc in ag_grants for mc in mcp_checks):
-                needs_approval_antigravity = True
-                approval_label = f"MCP: {mcp_server}/{mcp_tool}"
-                approval_cmd = f"{mcp_server}/{mcp_tool}"
-
-    # Check if tool, binary, command prefix, or file is already allowed (local cache or Antigravity config):
-    is_always_allowed = False
-    if is_antigravity and needs_approval_antigravity:
-        if tool_name == 'run_command':
-            checks = {
-                base_name, full_bin, cmd_prefix, cmd,
-                f"command({base_name})", f"command({cmd_prefix})", f"command({cmd})",
-                f"unsandboxed({base_name})", f"unsandboxed({cmd_prefix})", f"unsandboxed({cmd})"
-            }
-            if any(c in allowed_items or c in ag_grants for c in checks):
-                is_always_allowed = True
-        elif target_file:
-            target_real = os.path.realpath(os.path.expanduser(target_file))
-            target_dir = os.path.dirname(target_real)
-            prefix = "read_file" if tool_name == "view_file" else "write_file"
-            f_checks = {
-                target_file, target_real, target_dir,
-                f"{prefix}({target_file})", f"{prefix}({target_real})"
-            }
-            if any(fc in allowed_items or fc in ag_grants for fc in f_checks):
-                is_always_allowed = True
-        elif tool_name == 'read_url_content' and url:
-            if any(nc in allowed_items or nc in ag_grants for nc in {url, url_host, f"network({url_host})"}):
-                is_always_allowed = True
-        elif tool_name == 'call_mcp_tool' and mcp_server:
-            if any(mc in allowed_items or mc in ag_grants for mc in {mcp_server, f"{mcp_server}/{mcp_tool}", f"mcp({mcp_server})", f"mcp({mcp_server}/{mcp_tool})"}):
-                is_always_allowed = True
-
-    if is_always_allowed:
-        out = {'decision': 'allow'}
-        ov = build_overrides(full_bin, cmd, target_file, tool_name, is_bypass, url_host, mcp_server, mcp_tool)
-        if ov:
-            out['permissionOverrides'] = ov
-        print(json.dumps(out), flush=True)
-        payload['hook_event_name'] = 'PreToolUse'
-        payload['tool_name'] = tool_name
-        payload['tool_input'] = {'command': cmd or target_file or url or f"{mcp_server}/{mcp_tool}" or tool_name}
-        try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(0.3)
-            s.connect(socket_path)
-            s.sendall(json.dumps(payload).encode() + bytes([10]))
-            s.close()
-        except Exception:
-            pass
-        sys.exit(0)
-
-    if needs_approval_antigravity:
-        payload['hook_event_name'] = 'PermissionRequest'
-        label = approval_label or action_label or (f"Bypass: {cmd_prefix}" if is_bypass else (cmd_prefix or base_name or 'Command'))
-        payload['tool_name'] = label
-        payload['tool_input'] = {'command': approval_cmd or cmd or target_file or url or f"{mcp_server}/{mcp_tool}" or tool_name}
-
-    if event == 'PermissionRequest' or needs_approval_antigravity:
-        # Blocking approval flow: wait for decision from Coucou (up to 115s matching server)
+    # Claude Code: blocking approval flow for PermissionRequest (up to 115s)
+    if event == 'PermissionRequest':
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(115)
             s.connect(socket_path)
-            s.sendall(json.dumps(payload).encode() + bytes([10]))
+            s.sendall(json.dumps(payload).encode() + b'\\n')
             chunks = []
             while True:
                 chunk = s.recv(4096)
@@ -1235,104 +987,36 @@ def main():
                     decision = resp_obj.get('permissionDecision', '')
                 except Exception:
                     decision = ''
-                if is_antigravity:
-                    ov = build_overrides(full_bin, cmd, target_file, tool_name, is_bypass, url_host, mcp_server, mcp_tool)
-                    if decision == 'always':
-                        try:
-                            # 1. Update local always_allowed.json
-                            if tool_name == 'run_command':
-                                if cmd_prefix: allowed_items.add(cmd_prefix)
-                                if base_name: allowed_items.add(base_name)
-                                if full_bin: allowed_items.add(full_bin)
-                            elif target_file:
-                                allowed_items.add(target_file)
-                                target_real = os.path.realpath(os.path.expanduser(target_file))
-                                allowed_items.add(target_real)
-                                allowed_items.add(os.path.dirname(target_real))
-                            elif tool_name == 'read_url_content' and url_host:
-                                allowed_items.add(url_host)
-                            elif tool_name == 'call_mcp_tool' and mcp_server:
-                                allowed_items.add(f"mcp({mcp_server})")
-                                if mcp_tool: allowed_items.add(f"mcp({mcp_server}/{mcp_tool})")
-                            os.makedirs(os.path.dirname(allow_cache_file), exist_ok=True)
-                            with open(allow_cache_file, 'w', encoding='utf-8') as f:
-                                json.dump(list(allowed_items), f, indent=2)
-
-                            # 2. Persist directly into native Antigravity config.json (Global Permissions)
-                            native_grants = []
-                            if tool_name == 'run_command':
-                                if base_name:
-                                    native_grants.append(f"command({base_name})")
-                                    if is_bypass: native_grants.append(f"unsandboxed({base_name})")
-                                if cmd_prefix and cmd_prefix != base_name:
-                                    native_grants.append(f"command({cmd_prefix})")
-                                    if is_bypass: native_grants.append(f"unsandboxed({cmd_prefix})")
-                            elif target_file:
-                                pfx = "read_file" if tool_name == "view_file" else "write_file"
-                                native_grants.append(f"{pfx}({target_file})")
-                                p_real = os.path.realpath(os.path.expanduser(target_file))
-                                if p_real != target_file:
-                                    native_grants.append(f"{pfx}({p_real})")
-                            elif tool_name == 'read_url_content' and url_host:
-                                native_grants.append(f"network({url_host})")
-                            elif tool_name == 'call_mcp_tool' and mcp_server:
-                                native_grants.append(f"mcp({mcp_server})")
-                                if mcp_tool:
-                                    native_grants.append(f"mcp({mcp_server}/{mcp_tool})")
-                            persist_antigravity_grant(native_grants)
-                        except Exception:
-                            pass
-                        out = {'decision': 'allow'}
-                        if ov:
-                            out['permissionOverrides'] = ov
-                    elif decision == 'allow':
-                        out = {'decision': 'allow'}
-                        if ov:
-                            out['permissionOverrides'] = ov
-                    elif decision == 'deny':
-                        out = {'decision': 'deny', 'reason': "Refusé par l'utilisateur depuis Coucou"}
-                    else:
-                        out = {'decision': 'ask'}
+                if decision == 'allow':
+                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow'}}}
                     print(json.dumps(out), flush=True)
                     sys.exit(0)
-                else:
-                    if decision == 'allow':
-                        out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow'}}}
-                        print(json.dumps(out), flush=True)
-                        sys.exit(0)
-                    elif decision == 'always':
-                        suggestions = payload.get('permission_suggestions', [])
-                        out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow', 'updatedPermissions': suggestions}}}
-                        print(json.dumps(out), flush=True)
-                        sys.exit(0)
-                    elif decision == 'deny':
-                        out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'deny', 'message': 'Denied from Coucou'}}}
-                        print(json.dumps(out), flush=True)
-                        sys.exit(0)
+                elif decision == 'always':
+                    suggestions = payload.get('permission_suggestions', [])
+                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow', 'updatedPermissions': suggestions}}}
+                    print(json.dumps(out), flush=True)
+                    sys.exit(0)
+                elif decision == 'deny':
+                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'deny', 'message': 'Denied from Coucou'}}}
+                    print(json.dumps(out), flush=True)
+                    sys.exit(0)
         except Exception:
             pass
-        if is_antigravity:
-            print(json.dumps({'decision': 'ask'}), flush=True)
         sys.exit(0)
 
-    # All other events: fire-and-forget (0.3s timeout, never blocks)
+    # All other events (Antigravity & Claude Code): fire-and-forget (0.3s timeout, never blocks)
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(0.3)
         s.connect(socket_path)
-        s.sendall(json.dumps(payload).encode() + bytes([10]))
+        s.sendall(json.dumps(payload).encode() + b'\\n')
         s.close()
     except Exception:
-        pass  # Always exit cleanly
-    # Return valid decision for Antigravity hooks:
-    # Safe/normal tools (run_command, view_file, write_to_file, etc.) are allowed directly
-    # so Antigravity executes without any annoying/unnecessary prompts!
+        pass
+
+    # Antigravity PreToolUse requires a decision JSON output
     if is_antigravity and event == 'PreToolUse':
-        out = {'decision': 'allow'}
-        ov = build_overrides(full_bin, cmd, target_file, tool_name, is_bypass)
-        if ov:
-            out['permissionOverrides'] = ov
-        print(json.dumps(out), flush=True)
+        print(json.dumps({'decision': 'allow'}), flush=True)
     else:
         print('{}', flush=True)
     sys.exit(0)
