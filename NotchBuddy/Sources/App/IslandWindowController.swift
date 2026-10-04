@@ -15,6 +15,7 @@ final class IslandWindowController: NSWindowController {
     private var frameTimer: Timer?
     private var keyMonitor: Any?
     private var viewSubscription: AnyCancellable?
+    private var approvalSubscription: AnyCancellable?
 
     // Confused recovery timer (set by handleDizzy)
     private var confusedRecoveryTimer: DispatchWorkItem?
@@ -161,6 +162,14 @@ final class IslandWindowController: NSWindowController {
                     self.islandPanel.makeKey()
                 }
             }
+
+        // Approval answered → resume normal auto-collapse
+        approvalSubscription = state.$pendingApproval
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] approval in
+                guard let self, approval == nil, self.fsm.state == .home, !self.wasInIsland else { return }
+                self.fsm.mouseLeft()
+            }
     }
 
     // MARK: - FSM wiring
@@ -168,6 +177,11 @@ final class IslandWindowController: NSWindowController {
     private func wireFSM() {
         fsm.onTransition = { [weak self] from, to in
             guard let self else { return }
+            // A pending approval must stay visible until answered: bounce any collapse back to expanded
+            if self.state.pendingApproval != nil, to == .hidden || to == .petit {
+                self.fsm.forceExpand()
+                return
+            }
             switch to {
             case .hidden:
                 self.setMode(.hidden)
@@ -427,6 +441,7 @@ final class IslandWindowController: NSWindowController {
         // Hook server expand requests (alerts only)
         NotificationCenter.default.addObserver(forName: .hookExpand, object: nil, queue: .main) { [weak self] note in
             guard let self, let view = note.object as? IslandView else { return }
+            if view == .approval { self.fsm.forceExpand() }  // keep FSM in sync (else its timers collapse the island)
             self.expand(to: view)
         }
 
@@ -742,7 +757,8 @@ final class IslandWindowController: NSWindowController {
     // MARK: - Helpers
 
     func defaultView() -> IslandView {
-        state.tasks.isEmpty ? .empty : .overview
+        if state.pendingApproval != nil { return .approval }
+        return state.tasks.isEmpty ? .empty : .overview
     }
 
     func baseMode() -> IslandMode {
