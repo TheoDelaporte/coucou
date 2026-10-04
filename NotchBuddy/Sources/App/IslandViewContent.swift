@@ -217,22 +217,42 @@ struct ApprovalView: View {
         return lines.first.map(String.init) ?? text
     }
 
+    var permissionLabel: String {
+        if let tool = approval?.tool {
+            let lower = tool.lowercased()
+            if lower.contains("bypass") {
+                return "needs permission (Bypass Sandbox)"
+            } else if lower.contains("read") || lower.contains("view_file") {
+                return "needs permission (File Read)"
+            } else if lower.contains("write") || lower.contains("replace") {
+                return "needs permission (File Write)"
+            } else if lower.contains("destructive") {
+                return "needs permission (Critical Command)"
+            } else if lower.contains("network") {
+                return "needs permission (Network Access)"
+            } else if lower.contains("mcp") {
+                return "needs permission (MCP Tool)"
+            }
+        }
+        return "needs permission"
+    }
+
     var body: some View {
         ZStack {
             CardBackground(wash: .amber)
             VStack(alignment: .leading, spacing: 5) {
-                AgentWho(task: state.focusTask, label: "needs permission", overrideName: approval?.projectName)
+                AgentWho(task: state.focusTask, label: permissionLabel, overrideName: approval?.projectName)
                 CodeBlock(text: displayCommand)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 HStack(spacing: 8) {
-                    SecondaryButton("Deny") {
+                    SecondaryButton("Deny (N)") {
                         HookServer.shared.sendApprovalDecision("deny")
                     }
-                    PrimaryButton("Allow") {
+                    PrimaryButton("Allow (Y)") {
                         HookServer.shared.sendApprovalDecision("allow")
                     }
-                    SecondaryButton("Always") {
+                    SecondaryButton("Always (A)") {
                         HookServer.shared.sendApprovalDecision("always")
                     }
                 }
