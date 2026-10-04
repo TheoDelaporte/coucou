@@ -15,9 +15,14 @@ DerivedData/
 # iCloud stubs
 *.icloud
 
+# Python
+__pycache__/
+*.pyc
+
 # Local only (never published)
 .agents/
 .claude/
 _prive/
 task.md
 implementation_plan.md
+

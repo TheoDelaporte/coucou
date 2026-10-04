@@ -363,6 +363,7 @@ final class IslandWindowController: NSWindowController {
             setMode(.expanded)
         }
         state.lastActivity = .now
+        window?.orderFrontRegardless()
     }
 
     func collapse() {
