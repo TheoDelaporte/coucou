@@ -1,10 +1,12 @@
 import AppKit
 import SwiftUI
+import Combine
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     private(set) var islandController: IslandWindowController?
+    private var dndCancellable: AnyCancellable?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Ignore SIGPIPE — prevents crash when nb-hook closes socket before we write response
@@ -20,11 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupMenuBarItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        guard let button = statusItem?.button else { return }
-        button.image = NSImage(named: "MenuBarIcon") ?? NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "Coucou")
-        button.image?.size = NSSize(width: 24, height: 18)
-        button.image?.accessibilityDescription = "Coucou"
-        button.image?.isTemplate = true
+        updateMenuBarIcon()
 
         let menu = NSMenu()
         menu.delegate = self
@@ -38,6 +36,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
         statusItem?.menu = menu
+
+        dndCancellable = AppState.shared.$isDND
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.updateMenuBarIcon()
+            }
+    }
+
+    func updateMenuBarIcon() {
+        guard let button = statusItem?.button else { return }
+        let isDND = AppState.shared.isDND
+        let imageName = isDND ? "MenuBarIconSleep" : "MenuBarIcon"
+        let fallbackSymbol = isDND ? "moon.fill" : "circle.fill"
+        let img = NSImage(named: imageName) ?? NSImage(systemSymbolName: fallbackSymbol, accessibilityDescription: "Coucou")
+        img?.size = NSSize(width: 24, height: 18)
+        img?.accessibilityDescription = isDND ? "Coucou (Mode sommeil)" : "Coucou"
+        img?.isTemplate = true
+        button.image = img
+        button.toolTip = isDND ? "Coucou — Mode sommeil (Ne pas déranger)" : "Coucou"
     }
 
     // MARK: - Actions
