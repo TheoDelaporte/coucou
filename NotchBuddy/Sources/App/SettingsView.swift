@@ -303,6 +303,10 @@ struct SettingsView: View {
                 // MARK: Timings
                 GroupBox("Behavior") {
                     VStack(alignment: .leading, spacing: 10) {
+                        Toggle("Do Not Disturb (silence island and notifications)", isOn: Binding(
+                            get: { state.isDND },
+                            set: { _ in state.toggleDND() }
+                        ))
                         HStack(spacing: 8) {
                             Text("Close after")
                             TextField("60", value: $state.autoCloseInterval, format: .number)

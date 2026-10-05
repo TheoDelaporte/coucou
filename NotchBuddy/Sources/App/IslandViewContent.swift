@@ -2810,6 +2810,26 @@ struct SettingsIslandView: View {
                         .opacity(state.soundEnabled ? 1 : 0.4)
                 }
 
+                // Do Not Disturb row
+                HStack(spacing: 10) {
+                    Toggle("", isOn: Binding(
+                        get: { state.isDND },
+                        set: { _ in state.toggleDND() }
+                    ))
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .scaleEffect(0.75)
+                    .frame(width: 44)
+                    HStack(spacing: 6) {
+                        Image(systemName: state.isDND ? "moon.fill" : "moon")
+                            .font(.system(size: 12))
+                            .foregroundColor(state.isDND ? Color(hex: "#A78BFA") : Color(hex: "#8E939C"))
+                        Text("Do Not Disturb")
+                            .font(.system(size: 12.5))
+                            .foregroundColor(state.isDND ? Color(hex: "#A78BFA") : Color(hex: "#C5C8CD"))
+                    }
+                }
+
                 // Auto-close row
                 HStack(spacing: 10) {
                     Image(systemName: "timer")

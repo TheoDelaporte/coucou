@@ -488,6 +488,16 @@ struct IslandHeader: View {
             // Right: action icons
             HStack(spacing: 12) {
                 Button(action: {
+                    state.toggleDND()
+                }) {
+                    Image(systemName: state.isDND ? "moon.fill" : "moon")
+                        .font(.system(size: 14))
+                        .foregroundColor(state.isDND ? Color(hex: "#A78BFA") : Color(hex: "#8E939C"))
+                }
+                .buttonStyle(.plain)
+                .help(state.isDND ? "Désactiver Ne pas déranger" : "Activer Ne pas déranger (mode sommeil)")
+
+                Button(action: {
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                         state.view = .settings
                     }
@@ -497,6 +507,7 @@ struct IslandHeader: View {
                         .foregroundColor(state.view == .settings ? Color(hex: "#F5F6F8") : Color(hex: "#8E939C"))
                 }
                 .buttonStyle(.plain)
+                .help("Paramètres")
 
                 Button(action: { state.soundEnabled.toggle() }) {
                     Image(systemName: state.soundEnabled ? "speaker.wave.2" : "speaker.slash")
@@ -504,6 +515,7 @@ struct IslandHeader: View {
                         .foregroundColor(Color(hex: "#8E939C"))
                 }
                 .buttonStyle(.plain)
+                .help(state.soundEnabled ? "Couper le son" : "Activer le son")
 
                 CollapseButton()
             }

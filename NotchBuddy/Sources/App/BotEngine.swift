@@ -266,6 +266,8 @@ final class BotEngine: ObservableObject {
         setBadge(cfg.badge)
 
         switch newState {
+        case _ where prev == .sleeping && newState != .sleeping:
+            wakeUp()
         case .finished:
             doRoll(duration: 950, turns: 1)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -376,6 +378,48 @@ final class BotEngine: ObservableObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
                 SoundEngine.shared.play("annoyed")
             }
+        }
+    }
+
+    // MARK: - Wake up animation
+
+    func wakeUp() {
+        eyeOverride = nil
+        // Groggy-to-awake eye opening
+        anim("open", keys: [
+            TweenKey(target: 0.1,  duration: 90,  ease: Ease.inOut),
+            TweenKey(target: 0.7,  duration: 180, ease: Ease.out),
+            TweenKey(target: 0.2,  duration: 80,  ease: Ease.inOut),
+            TweenKey(target: 1.0,  duration: 180, ease: Ease.back),
+        ])
+        // Good-morning vertical stretch, energetic squash, then elastic settle
+        anim("sy", keys: [
+            TweenKey(target: 1.22, duration: 320, ease: Ease.out),
+            TweenKey(target: 0.84, duration: 160, ease: Ease.inOut),
+            TweenKey(target: 1.08, duration: 140, ease: Ease.out),
+            TweenKey(target: 1.0,  duration: 180, ease: Ease.back),
+        ])
+        anim("sx", keys: [
+            TweenKey(target: 0.86, duration: 320, ease: Ease.out),
+            TweenKey(target: 1.16, duration: 160, ease: Ease.inOut),
+            TweenKey(target: 0.95, duration: 140, ease: Ease.out),
+            TweenKey(target: 1.0,  duration: 180, ease: Ease.back),
+        ])
+        // Cute upward hop
+        anim("oy", keys: [
+            TweenKey(target: -0.16, duration: 320, ease: Ease.out),
+            TweenKey(target: 0.04,  duration: 160, ease: Ease.inOut),
+            TweenKey(target: 0,     duration: 180, ease: Ease.back),
+        ])
+        // Cheerful rosy cheeks
+        anim("blush", keys: [
+            TweenKey(target: 0.75, duration: 250, ease: Ease.out),
+            TweenKey(target: 0.75, duration: 350, ease: Ease.lin),
+            TweenKey(target: 0,    duration: 350, ease: Ease.inOut),
+        ])
+        // Sparks of wakefulness
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.emit(.spark, count: 4)
         }
     }
 
