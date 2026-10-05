@@ -257,7 +257,7 @@ final class IslandWindowController: NSWindowController {
         let inIsland   = islandRect.insetBy(dx: -6, dy: -6).contains(local)
 
         // Toggle click-through
-        let shouldAcceptMouse = inIsland || inAttachDrag || attachDragStart != nil
+        let shouldAcceptMouse = (!state.isDND || state.mode != .hidden) && (inIsland || inAttachDrag || attachDragStart != nil)
         if panel.ignoresMouseEvents == shouldAcceptMouse {
             panel.ignoresMouseEvents = !shouldAcceptMouse
             if shouldAcceptMouse, let cv = panel.contentView {
@@ -278,6 +278,10 @@ final class IslandWindowController: NSWindowController {
         // Feed FSM hover enter/leave
         if inIsland && !wasInIsland {
             guard !inAttachDrag else { wasInIsland = inIsland; return }
+            if state.isDND && state.mode == .hidden {
+                wasInIsland = inIsland
+                return
+            }
             // If in coucou: tell greeting to stay open (tc → infinity)
             if fsm.state == .coucou {
                 NotificationCenter.default.post(name: .greetingHover, object: nil)
@@ -389,6 +393,15 @@ final class IslandWindowController: NSWindowController {
         window?.resignKey()
     }
 
+    func hide() {
+        pendingIslandClick = false
+        state.isPinned = false
+        finishedPinTimer?.cancel()
+        fsm.forceHide()
+        setMode(.hidden)
+        window?.resignKey()
+    }
+
     // MARK: - Keyboard (Escape closes)
 
     private func startKeyMonitor() {
@@ -441,6 +454,7 @@ final class IslandWindowController: NSWindowController {
         // Hook server expand requests (alerts only)
         NotificationCenter.default.addObserver(forName: .hookExpand, object: nil, queue: .main) { [weak self] note in
             guard let self, let view = note.object as? IslandView else { return }
+            guard !self.state.isDND else { return }
             if view == .approval { self.fsm.forceExpand() }  // keep FSM in sync (else its timers collapse the island)
             self.expand(to: view)
         }
@@ -448,6 +462,7 @@ final class IslandWindowController: NSWindowController {
         // Hook server compact reveal (non-alert work events: session start, tool use, etc.)
         NotificationCenter.default.addObserver(forName: .hookReveal, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
+            guard !self.state.isDND else { return }
             self.relocateToCurrentFocusScreen()
             self.fsm.reveal()
         }
@@ -455,6 +470,11 @@ final class IslandWindowController: NSWindowController {
         // Collapse requests from views (OK button, etc.)
         NotificationCenter.default.addObserver(forName: .islandCollapse, object: nil, queue: .main) { [weak self] _ in
             self?.collapse()
+        }
+
+        // Hide requests from views or DND
+        NotificationCenter.default.addObserver(forName: .islandHide, object: nil, queue: .main) { [weak self] _ in
+            self?.hide()
         }
 
         // .botDizzy — posted by BotEngine.slap() on 3rd hit; show confused view + recover after 3.3s
@@ -1026,6 +1046,7 @@ extension Notification.Name {
     static let botMorphTo       = Notification.Name("notchBuddy.botMorphTo")
     static let islandAction     = Notification.Name("notchBuddy.islandAction")
     static let islandCollapse   = Notification.Name("notchBuddy.islandCollapse")
+    static let islandHide       = Notification.Name("notchBuddy.islandHide")
     static let openFullSettings = Notification.Name("notchBuddy.openFullSettings")
     static let hookReveal       = Notification.Name("notchBuddy.hookReveal")
     // Greeting ↔ IslandWindowController

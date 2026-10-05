@@ -84,6 +84,12 @@ final class IslandStateMachine {
         transition(to: .petit)
     }
 
+    /// Forcibly transition to hidden immediately
+    func forceHide() {
+        cancelTimers()
+        transition(to: .hidden)
+    }
+
     /// Forcibly transition to home (expanded mode) immediately
     func forceExpand() {
         cancelTimers()

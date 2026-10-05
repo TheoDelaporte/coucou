@@ -27,7 +27,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.image?.isTemplate = true
 
         let menu = NSMenu()
+        menu.delegate = self
         menu.addItem(withTitle: "Open Coucou", action: #selector(openIsland), keyEquivalent: "")
+        let dndItem = NSMenuItem(title: "Do Not Disturb", action: #selector(toggleDND), keyEquivalent: "")
+        dndItem.state = AppState.shared.isDND ? .on : .off
+        menu.addItem(dndItem)
         menu.addItem(.separator())
         menu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         menu.addItem(.separator())
@@ -40,6 +44,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openIsland() {
         islandController?.expand(to: .overview)
+    }
+
+    @objc private func toggleDND() {
+        AppState.shared.toggleDND()
     }
 
     private var settingsWindow: NSWindow?
@@ -62,7 +70,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupIsland() {
         islandController = IslandWindowController()
         islandController?.showWindow(nil)
-        islandController?.fsm.launch()
+        if !AppState.shared.isDND {
+            islandController?.fsm.launch()
+        }
         HookServer.shared.start()
         N8nPoller.shared.start()
         VercelPoller.shared.start()
@@ -74,5 +84,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AntigravityContextService.shared.start()
         NotificationCenter.default.addObserver(self, selector: #selector(openSettings),
                                                name: .openFullSettings, object: nil)
+    }
+}
+
+extension AppDelegate: NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) {
+        if let item = menu.item(withTitle: "Do Not Disturb") {
+            item.state = AppState.shared.isDND ? .on : .off
+        }
     }
 }

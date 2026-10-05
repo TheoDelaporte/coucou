@@ -75,6 +75,11 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(soundEnabled, forKey: "soundEnabled") }
     }
 
+    // Do Not Disturb (DND) / Sleep mode — persisted
+    @Published var isDND: Bool = false {
+        didSet { UserDefaults.standard.set(isDND, forKey: "isDND") }
+    }
+
     // Sound volume (0–0.2) — persisted, synced to SoundEngine
     @Published var soundVolume: Double = 0.12 {
         didSet {
@@ -191,6 +196,7 @@ final class AppState: ObservableObject {
         let ud = UserDefaults.standard
 
         if let v = ud.object(forKey: "soundEnabled") as? Bool   { soundEnabled = v }
+        if let v = ud.object(forKey: "isDND")        as? Bool   { isDND = v }
         if let v = ud.object(forKey: "soundVolume")  as? Double { soundVolume  = v }
         // Migrate old 60s default → 15s
         if let v = ud.object(forKey: "autoCloseInterval") as? Double {
@@ -222,7 +228,19 @@ final class AppState: ObservableObject {
     }
 
     var effectiveState: BotState {
-        stateOverride ?? focusTask?.state ?? .idle
+        if isDND { return .sleeping }
+        return stateOverride ?? focusTask?.state ?? .idle
+    }
+
+    func toggleDND() {
+        if !isDND {
+            SoundEngine.shared.play("sleep")
+            isDND = true
+            NotificationCenter.default.post(name: .islandHide, object: nil)
+        } else {
+            isDND = false
+            SoundEngine.shared.play("peek")
+        }
     }
 
     // MARK: - Task management
