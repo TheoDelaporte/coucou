@@ -239,7 +239,11 @@ final class AppState: ObservableObject {
             NotificationCenter.default.post(name: .islandHide, object: nil)
         } else {
             isDND = false
-            SoundEngine.shared.play("peek")
+            SoundEngine.shared.play("pop")
+            NotificationCenter.default.post(name: .botWakeUp, object: nil)
+            if mode == .hidden {
+                NotificationCenter.default.post(name: .hookReveal, object: nil)
+            }
         }
     }
 
