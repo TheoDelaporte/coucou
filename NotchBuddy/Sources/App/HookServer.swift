@@ -102,15 +102,324 @@ final class HookServer: @unchecked Sendable {
         }
 
         let eventName = payload["hook_event_name"] as? String ?? ""
+        let isAntigravity = payload["conversationId"] != nil
 
-        if eventName == "PermissionRequest" {
-            // Hold fd open — Claude Code waits for our decision (up to 120s)
+        if eventName == "PermissionRequest" || (isAntigravity && eventName == "PreToolUse" && isDangerousTool(payload)) {
+            // Hold fd open — Claude Code (PermissionRequest) or Antigravity (PreToolUse) waits for our decision (up to 120s)
             Task { @MainActor in self.processPermissionRequest(fd: fd, payload: payload) }
         } else {
             Task { @MainActor in self.processEvent(name: eventName, payload: payload) }
             sendLine(fd: fd, text: #"{"ok":true}"#)
             close(fd)
         }
+    }
+
+    // MARK: - Dangerous Tool Detection (Antigravity & Shell)
+
+    private func isAlwaysAllowed(cmd: String, tool: String) -> Bool {
+        let path = Self.supportDir.appendingPathComponent("always_allowed.json").path
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let list = try? JSONSerialization.jsonObject(with: data) as? [String] else {
+            return false
+        }
+        let rules = Set(list.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+        if !tool.isEmpty {
+            if rules.contains(tool) || rules.contains("mcp(\(tool))") {
+                return true
+            }
+            if tool.contains("/") {
+                let srv = String(tool.split(separator: "/").first ?? "")
+                if rules.contains(srv) || rules.contains("mcp(\(srv))") {
+                    return true
+                }
+            }
+        }
+        if !cmd.isEmpty {
+            let cmdClean = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
+            if rules.contains(cmdClean) {
+                return true
+            }
+            var words = cmdClean.split(separator: " ").map(String.init)
+            while let first = words.first, first.contains("=") && !first.hasPrefix("-") {
+                words.removeFirst()
+            }
+            if let binFull = words.first {
+                let binBase = URL(fileURLWithPath: binFull).lastPathComponent.lowercased()
+                if rules.contains(binFull) || rules.contains(binBase) {
+                    return true
+                }
+                for i in 1...words.count {
+                    let p = words[0..<i].joined(separator: " ")
+                    if rules.contains(p) { return true }
+                    if i > 1 {
+                        let pb = ([binBase] + words[1..<i]).joined(separator: " ")
+                        if rules.contains(pb) { return true }
+                    }
+                }
+            }
+            for r in rules {
+                if !r.isEmpty && (cmdClean == r || cmdClean.hasPrefix(r + " ") || cmdClean.hasPrefix(r + "\t")) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    private func isMajorDestructiveCommand(_ cmd: String) -> Bool {
+        let trimmed = cmd.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if trimmed.isEmpty { return false }
+
+        let subCommands = trimmed.components(separatedBy: CharacterSet(charactersIn: ";|&"))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        for sub in subCommands {
+            var words = sub.split(separator: " ").map(String.init)
+            while let first = words.first, first.contains("=") && !first.hasPrefix("-") {
+                words.removeFirst()
+            }
+            guard let binaryWithExt = words.first else { continue }
+            let binary = URL(fileURLWithPath: binaryWithExt).lastPathComponent.lowercased()
+
+            if binary == "sudo" || binary == "shutdown" || binary == "reboot" {
+                return true
+            }
+            if binary.hasPrefix("mkfs") {
+                return true
+            }
+            if binary == "rm" {
+                let args = words.dropFirst()
+                let flags = args.filter { $0.hasPrefix("-") }.map { String($0.dropFirst()) }.joined()
+                let hasRF = (flags.contains("r") || flags.contains("R")) && flags.contains("f")
+                let targets = args.filter { !$0.hasPrefix("-") }
+                if hasRF && targets.contains(where: { $0 == "/" || $0 == "/*" || $0 == "~" || $0 == "$home" || $0 == "/system" || $0 == "/library" }) {
+                    return true
+                }
+            }
+            if binary == "dd" {
+                let args = words.dropFirst()
+                if args.contains(where: { $0.hasPrefix("if=") }) {
+                    return true
+                }
+            }
+            if words.contains("sudo") || words.contains("shutdown") || words.contains("reboot") {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func isDangerousTool(_ payload: [String: Any]) -> Bool {
+        var toolName = payload["tool_name"] as? String ?? ""
+        var args: [String: Any] = [:]
+
+        if let tc = payload["toolCall"] as? [String: Any] {
+            if let name = tc["name"] as? String, !name.isEmpty {
+                toolName = name
+            }
+            if let tcArgs = tc["args"] as? [String: Any] {
+                args = tcArgs
+            }
+        } else if let toolInput = payload["tool_input"] as? [String: Any] {
+            args = toolInput
+        }
+
+        // 1. Shell commands
+        if toolName == "run_command" || toolName == "Command" || toolName == "Bash" {
+            let cmd = (args["CommandLine"] as? String) ?? (args["command"] as? String) ?? ""
+            if isAlwaysAllowed(cmd: cmd, tool: toolName) {
+                return false
+            }
+            if isMajorDestructiveCommand(cmd) {
+                return true
+            }
+            let isBypass = (args["BypassSandbox"] as? Bool) ?? false
+            if isBypass {
+                return isDangerousShellCommand(cmd)
+            }
+            // BypassSandbox: false and not major destructive -> auto-allow
+            return false
+        }
+
+        // 2. Read-only built-in tools
+        let readOnlyTools: Set<String> = [
+            "view_file", "list_dir", "grep_search", "find_by_name",
+            "read_url_content", "search_web", "read_resource",
+            "list_resources", "ask_question", "schedule"
+        ]
+        if readOnlyTools.contains(toolName) {
+            return false
+        }
+
+        // 3. Task / subagent management (read vs write)
+        if toolName == "manage_task" || toolName == "manage_subagents" {
+            let action = (args["Action"] as? String)?.lowercased() ?? ""
+            if action == "list" || action == "status" {
+                return false
+            }
+            if isAlwaysAllowed(cmd: "", tool: toolName) {
+                return false
+            }
+            return true
+        }
+
+        // 4. MCP Tools
+        if toolName == "call_mcp_tool" {
+            let server = (args["ServerName"] as? String)?.lowercased() ?? ""
+            let tool = (args["ToolName"] as? String) ?? ""
+            let fullMcp = "\(server)/\(tool)"
+            if isAlwaysAllowed(cmd: "", tool: fullMcp) {
+                return false
+            }
+            return isDangerousMcpTool(server: server, tool: tool)
+        }
+
+        // 5. File / other tools
+        let target = (args["TargetFile"] as? String) ?? (args["AbsolutePath"] as? String) ?? ""
+        if !target.isEmpty && isAlwaysAllowed(cmd: target, tool: toolName) {
+            return false
+        }
+        if isAlwaysAllowed(cmd: "", tool: toolName) {
+            return false
+        }
+
+        // 6. Explicitly sensitive tools
+        let sensitiveTools: Set<String> = [
+            "write_to_file", "replace_file_content", "multi_replace_file_content",
+            "apply_diff", "generate_image", "invoke_subagent", "define_subagent",
+            "send_message"
+        ]
+        if sensitiveTools.contains(toolName) {
+            return true
+        }
+
+        // Fail-safe default
+        return true
+    }
+
+    private func isDangerousShellCommand(_ cmd: String) -> Bool {
+        let trimmed = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return false }
+
+        let subCommands = trimmed.components(separatedBy: CharacterSet(charactersIn: ";|&"))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        for sub in subCommands {
+            if isDangerousSingleShellCommand(sub) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func isDangerousSingleShellCommand(_ cmd: String) -> Bool {
+        let trimmed = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return false }
+
+        let stripped = trimmed
+            .replacingOccurrences(of: "2>/dev/null", with: "")
+            .replacingOccurrences(of: "2>&1", with: "")
+            .replacingOccurrences(of: "1>/dev/null", with: "")
+            .replacingOccurrences(of: "&>/dev/null", with: "")
+        if stripped.contains(">") {
+            return true
+        }
+
+        var words = trimmed.split(separator: " ").map(String.init)
+        while let first = words.first, first.contains("=") && !first.hasPrefix("-") {
+            words.removeFirst()
+        }
+        guard let binaryWithExt = words.first else { return false }
+        let binary = URL(fileURLWithPath: binaryWithExt).lastPathComponent.lowercased()
+
+        let safeShellBinaries: Set<String> = [
+            "ls", "pwd", "cat", "head", "tail", "less", "more",
+            "which", "whereis", "type", "file", "stat",
+            "grep", "egrep", "fgrep", "rg", "ag", "wc",
+            "find", "tree", "diff", "cmp",
+            "uname", "whoami", "id", "date", "uptime",
+            "echo", "printf", "true", "false", "test", "["
+        ]
+
+        if safeShellBinaries.contains(binary) {
+            if binary == "find" {
+                if words.contains("-exec") || words.contains("-execdir") || words.contains("-delete") {
+                    return true
+                }
+            }
+            return false
+        }
+
+        if binary == "git" {
+            let args = words.dropFirst()
+            var subVerb = ""
+            for arg in args {
+                if !arg.hasPrefix("-") {
+                    subVerb = arg.lowercased()
+                    break
+                }
+            }
+            let safeGitSubverbs: Set<String> = [
+                "status", "diff", "log", "show", "branch", "rev-parse",
+                "describe", "tag", "remote", "config"
+            ]
+            if safeGitSubverbs.contains(subVerb) {
+                if subVerb == "branch" {
+                    if args.contains("-d") || args.contains("-D") || args.contains("-m") || args.contains("-M") {
+                        return true
+                    }
+                }
+                if subVerb == "remote" {
+                    if args.contains("add") || args.contains("remove") || args.contains("rename") || args.contains("set-url") {
+                        return true
+                    }
+                }
+                if subVerb == "tag" {
+                    if args.contains("-d") || args.contains("--delete") {
+                        return true
+                    }
+                }
+                return false
+            }
+            return true
+        }
+
+        return true
+    }
+
+    private func isDangerousMcpTool(server: String, tool: String) -> Bool {
+        let s = server.lowercased()
+        let t = tool.lowercased()
+
+        if s == "context7" || s == "snyk" {
+            return false
+        }
+        if s == "serena" {
+            let serenaReadOnly: Set<String> = [
+                "read_file", "list_dir", "find_file", "search_for_pattern",
+                "get_symbols_overview", "find_symbol", "find_referencing_symbols",
+                "find_implementations", "find_declaration", "get_diagnostics_for_file",
+                "read_memory", "list_memories", "get_current_config",
+                "initial_instructions", "onboarding"
+            ]
+            return !serenaReadOnly.contains(t)
+        }
+        if s == "notion" {
+            if t.hasPrefix("api-get-") || t.hasPrefix("api-retrieve-") || t.hasPrefix("api-list-") {
+                return false
+            }
+            return true
+        }
+
+        let readOnlyPrefixes = ["get", "list", "read", "view", "search", "find", "query", "check"]
+        for p in readOnlyPrefixes {
+            if t.hasPrefix(p) {
+                return false
+            }
+        }
+        return true
     }
 
 
@@ -231,6 +540,21 @@ final class HookServer: @unchecked Sendable {
 
         case "Stop":
             cleanupPendingApproval(for: sessionId)
+            if state.pendingApproval != nil {
+                for (_, item) in pendingApprovals {
+                    let fd = item.fd
+                    Task.detached { [weak self] in
+                        self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
+                        close(fd)
+                    }
+                }
+                pendingApprovals.removeAll()
+                state.pendingApproval = nil
+                state.isPinned = false
+                if state.view == .approval {
+                    state.view = state.tasks.isEmpty ? .empty : .overview
+                }
+            }
             state.updateTask(id: "integration_claude", state: .finished)
             if let message = payload["message"] as? String, !message.isEmpty {
                 appendStep(id: "integration_claude", step: String(message.prefix(60)))
@@ -379,6 +703,9 @@ final class HookServer: @unchecked Sendable {
             command = input["command"] as? String ?? tool
         }
         if let tc = payload["toolCall"] as? [String: Any] {
+            if let name = tc["name"] as? String, !name.isEmpty {
+                tool = name
+            }
             if let args = tc["args"] as? [String: Any] {
                 if let cmd = args["CommandLine"] as? String, !cmd.isEmpty {
                     command = cmd
@@ -389,11 +716,6 @@ final class HookServer: @unchecked Sendable {
                 } else if let server = args["ServerName"] as? String, let tname = args["ToolName"] as? String {
                     tool = "\(server)/\(tname)"
                     command = "\(server)/\(tname)"
-                }
-            }
-            if tool == "Command" || tool == "run_command" || tool == "call_mcp_tool" {
-                if let name = tc["name"] as? String, !name.isEmpty {
-                    tool = name
                 }
             }
         }
@@ -700,7 +1022,7 @@ final class HookServer: @unchecked Sendable {
                 ["type": "command", "command": "\"\(hookPath)\" PreInvocation", "timeout": 10]
             ],
             "PreToolUse": [
-                ["matcher": "*", "hooks": [["type": "command", "command": "\"\(hookPath)\" PreToolUse", "timeout": 10]]]
+                ["matcher": "*", "hooks": [["type": "command", "command": "\"\(hookPath)\" PreToolUse", "timeout": 120]]]
             ],
             "PostToolUse": [
                 ["matcher": "*", "hooks": [["type": "command", "command": "\"\(hookPath)\" PostToolUse", "timeout": 10]]]
@@ -914,9 +1236,315 @@ extension Notification.Name {
 
 private let nbHookScript = """
 #!/usr/bin/env python3
-# nb-hook — Coucou hook relay for Claude Code
+# nb-hook — Coucou hook relay for Claude Code and Antigravity
 # Reads JSON from stdin, forwards to Coucou via Unix socket, translates response.
-import sys, json, os, socket
+import sys, json, os, socket, re
+
+SAFE_READONLY_SHELL_CMDS = {
+    'ls', 'pwd', 'cat', 'head', 'tail', 'less', 'more',
+    'which', 'whereis', 'type', 'file', 'stat',
+    'grep', 'egrep', 'fgrep', 'rg', 'ag', 'wc',
+    'find', 'tree', 'diff', 'cmp',
+    'uname', 'whoami', 'id', 'date', 'uptime',
+    'echo', 'printf', 'true', 'false', 'test', '['
+}
+
+SAFE_GIT_SUBCOMMANDS = {
+    'status', 'diff', 'log', 'show', 'branch', 'rev-parse',
+    'describe', 'tag', 'remote', 'config'
+}
+
+READ_ONLY_TOOLS = {
+    'view_file', 'list_dir', 'grep_search', 'find_by_name',
+    'read_url_content', 'search_web', 'read_resource',
+    'list_resources', 'ask_question', 'schedule'
+}
+
+ALWAYS_ALLOWED_PATH = os.path.expanduser('~/Library/Application Support/NotchBuddy/always_allowed.json')
+
+def is_always_allowed(cmd="", tool_name=""):
+    try:
+        if not os.path.exists(ALWAYS_ALLOWED_PATH):
+            return False
+        with open(ALWAYS_ALLOWED_PATH, 'r', encoding='utf-8') as f:
+            allowed = json.load(f)
+        if not isinstance(allowed, list):
+            return False
+        rules = set(str(r).strip() for r in allowed if r)
+    except Exception:
+        return False
+
+    if tool_name:
+        t = tool_name.strip()
+        if t in rules or f"mcp({t})" in rules:
+            return True
+        if "/" in t:
+            server = t.split("/")[0]
+            if server in rules or f"mcp({server})" in rules:
+                return True
+
+    if cmd:
+        cmd_clean = cmd.strip()
+        if not cmd_clean:
+            return False
+        if cmd_clean in rules:
+            return True
+
+        words = cmd_clean.split()
+        while words and "=" in words[0] and not words[0].startswith("-"):
+            words.pop(0)
+        if words:
+            binary_full = words[0]
+            binary_base = os.path.basename(binary_full).lower()
+            if binary_full in rules or binary_base in rules:
+                return True
+            for i in range(1, len(words) + 1):
+                prefix = " ".join(words[:i])
+                if prefix in rules:
+                    return True
+                if i > 1:
+                    prefix_base = " ".join([binary_base] + words[1:i])
+                    if prefix_base in rules:
+                        return True
+
+        for r in rules:
+            if not r:
+                continue
+            if cmd_clean == r or cmd_clean.startswith(r + " ") or cmd_clean.startswith(r + "\\t"):
+                return True
+            if (r.startswith("http://") or r.startswith("https://") or "/" in r or "." in r) and r in cmd_clean:
+                return True
+
+    return False
+
+def save_always_allowed(cmd="", tool_name=""):
+    try:
+        os.makedirs(os.path.dirname(ALWAYS_ALLOWED_PATH), exist_ok=True)
+        items = []
+        if os.path.exists(ALWAYS_ALLOWED_PATH):
+            try:
+                with open(ALWAYS_ALLOWED_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        items = data
+            except Exception:
+                items = []
+
+        to_add = []
+        if cmd:
+            cmd_clean = cmd.strip()
+            if cmd_clean and cmd_clean not in items:
+                to_add.append(cmd_clean)
+            words = cmd_clean.split()
+            while words and "=" in words[0] and not words[0].startswith("-"):
+                words.pop(0)
+            if words:
+                binary = os.path.basename(words[0])
+                if binary and binary not in items and binary not in to_add:
+                    to_add.append(binary)
+                if len(words) >= 2:
+                    prefix = f"{binary} {words[1]}"
+                    if prefix not in items and prefix not in to_add:
+                        to_add.append(prefix)
+        if tool_name:
+            t = tool_name.strip()
+            if t and t not in items and t not in to_add:
+                to_add.append(t)
+            if "/" in t:
+                mcp_full = f"mcp({t})"
+                if mcp_full not in items and mcp_full not in to_add:
+                    to_add.append(mcp_full)
+                server = t.split("/")[0]
+                mcp_srv = f"mcp({server})"
+                if mcp_srv not in items and mcp_srv not in to_add:
+                    to_add.append(mcp_srv)
+
+        if to_add:
+            items.extend(to_add)
+            with open(ALWAYS_ALLOWED_PATH, "w", encoding="utf-8") as f:
+                json.dump(items, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+def is_major_destructive_command(cmd):
+    if not cmd:
+        return False
+    cmd_lower = cmd.strip().lower()
+    parts = re.split(r"[;&|]+", cmd_lower)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        words = part.split()
+        while words and "=" in words[0] and not words[0].startswith("-"):
+            words.pop(0)
+        if not words:
+            continue
+        binary = os.path.basename(words[0])
+        if binary in ("sudo", "shutdown", "reboot"):
+            return True
+        if binary.startswith("mkfs"):
+            return True
+        if binary == "rm":
+            args = words[1:]
+            flags = "".join(x[1:] for x in args if x.startswith("-"))
+            has_rf = ("r" in flags or "R" in flags) and "f" in flags
+            targets = [a for a in args if not a.startswith("-")]
+            if has_rf and any(t in ("/", "/*", "~", "$home", "/system", "/library") for t in targets):
+                return True
+        if binary == "dd" and any(a.startswith("if=") for a in words[1:]):
+            return True
+        if "sudo" in words or "shutdown" in words or "reboot" in words:
+            return True
+    return False
+
+def is_sensitive_single_cmd(cmd_str):
+    cmd_str = cmd_str.strip()
+    if not cmd_str:
+        return False
+
+    cleaned_redirs = (
+        cmd_str.replace('2>/dev/null', '')
+               .replace('2>&1', '')
+               .replace('1>/dev/null', '')
+               .replace('&>/dev/null', '')
+    )
+    if '>' in cleaned_redirs:
+        return True
+
+    words = cmd_str.split()
+    while words and '=' in words[0] and not words[0].startswith('-'):
+        words.pop(0)
+    if not words:
+        return False
+
+    binary = os.path.basename(words[0]).lower()
+
+    if binary in SAFE_READONLY_SHELL_CMDS:
+        if binary == 'find':
+            if any(arg in ('-exec', '-execdir', '-delete') for arg in words):
+                return True
+        return False
+
+    if binary == 'git':
+        args = words[1:]
+        subverb = None
+        for arg in args:
+            if not arg.startswith('-'):
+                subverb = arg.lower()
+                break
+        if subverb in SAFE_GIT_SUBCOMMANDS:
+            if subverb == 'branch' and any(a in ('-d', '-D', '-m', '-M') for a in args):
+                return True
+            if subverb == 'remote' and any(a in ('add', 'remove', 'rename', 'set-url') for a in args):
+                return True
+            if subverb == 'tag' and any(a in ('-d', '--delete') for a in args):
+                return True
+            return False
+        return True
+
+    return True
+
+def is_sensitive_shell_command(cmd):
+    if not cmd or not cmd.strip():
+        return False
+    parts = re.split(r'[;&|]+', cmd)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if is_sensitive_single_cmd(part):
+            return True
+    return False
+
+def is_sensitive_mcp_tool(server, tool_name):
+    s = server.lower()
+    t = tool_name.lower()
+    if s in ('context7', 'snyk'):
+        return False
+    if s == 'serena':
+        serena_read = {
+            'read_file', 'list_dir', 'find_file', 'search_for_pattern',
+            'get_symbols_overview', 'find_symbol', 'find_referencing_symbols',
+            'find_implementations', 'find_declaration', 'get_diagnostics_for_file',
+            'read_memory', 'list_memories', 'get_current_config',
+            'initial_instructions', 'onboarding'
+        }
+        return t not in serena_read
+    if s == 'notion':
+        if t.startswith('api-get-') or t.startswith('api-retrieve-') or t.startswith('api-list-'):
+            return False
+        return True
+
+    read_prefixes = ('get', 'list', 'read', 'view', 'search', 'find', 'query', 'check')
+    for p in read_prefixes:
+        if t.startswith(p):
+            return False
+    return True
+
+def check_antigravity_tool_approval(payload):
+    tc = payload.get('toolCall') or {}
+    tool = tc.get('name') or payload.get('tool_name') or ''
+    args = tc.get('args') or payload.get('tool_input') or {}
+
+    cmd_ident = ""
+    tool_ident = tool
+
+    if tool in ('run_command', 'Bash', 'Command'):
+        cmd = args.get('CommandLine') or args.get('command') or ''
+        cmd_ident = cmd
+        is_bypass = (args.get('BypassSandbox') is True)
+
+        if is_always_allowed(cmd=cmd):
+            return False, cmd_ident, tool_ident
+        if is_major_destructive_command(cmd):
+            return True, cmd_ident, tool_ident
+        if not is_sensitive_shell_command(cmd):
+            return False, cmd_ident, tool_ident
+        if not is_bypass:
+            return False, cmd_ident, tool_ident
+        return True, cmd_ident, tool_ident
+
+    if tool in READ_ONLY_TOOLS:
+        return False, cmd_ident, tool_ident
+
+    if tool in ('manage_task', 'manage_subagents'):
+        action = str(args.get('Action', '')).lower()
+        if action in ('list', 'status'):
+            return False, cmd_ident, tool_ident
+        if is_always_allowed(tool_name=tool):
+            return False, cmd_ident, tool_ident
+        return True, cmd_ident, tool_ident
+
+    if tool == 'call_mcp_tool':
+        server = str(args.get('ServerName', '')).lower()
+        tname = str(args.get('ToolName', ''))
+        tool_ident = f"{server}/{tname}"
+        if is_always_allowed(tool_name=tool_ident):
+            return False, cmd_ident, tool_ident
+        if not is_sensitive_mcp_tool(server, tname):
+            return False, cmd_ident, tool_ident
+        return True, cmd_ident, tool_ident
+
+    target = args.get('TargetFile') or args.get('AbsolutePath') or ''
+    cmd_ident = target
+    if target and is_always_allowed(cmd=target, tool_name=tool):
+        return False, cmd_ident, tool_ident
+    if is_always_allowed(tool_name=tool):
+        return False, cmd_ident, tool_ident
+
+    sensitive_tools = {
+        'write_to_file', 'replace_file_content', 'multi_replace_file_content',
+        'apply_diff', 'generate_image', 'invoke_subagent', 'define_subagent',
+        'send_message'
+    }
+    if tool in sensitive_tools:
+        return True, cmd_ident, tool_ident
+
+    return True, cmd_ident, tool_ident
+
+def is_sensitive_antigravity_tool(payload):
+    return check_antigravity_tool_approval(payload)[0]
 
 def main():
     try:
@@ -1004,6 +1632,58 @@ def main():
             pass
         sys.exit(0)
 
+    # Antigravity PreToolUse approval or telemetry
+    if is_antigravity and event == 'PreToolUse':
+        must_prompt, cmd_ident, tool_ident = check_antigravity_tool_approval(payload)
+        if not must_prompt:
+            # Auto-allow immédiat: télémétrie fire-and-forget (0.3s)
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(0.3)
+                s.connect(socket_path)
+                s.sendall(json.dumps(payload).encode() + b'\\n')
+                s.close()
+            except Exception:
+                pass
+            print(json.dumps({"allow_tool": True}), flush=True)
+            sys.exit(0)
+
+        # Prompt Notch: ouverture socket 115s pour demander l'accord dans le Notch
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(115)
+            s.connect(socket_path)
+            s.sendall(json.dumps(payload).encode() + b'\\n')
+            chunks = []
+            while True:
+                chunk = s.recv(4096)
+                if not chunk: break
+                chunks.append(chunk)
+                if 10 in chunk: break
+            s.close()
+            response = b''.join(chunks).decode().strip()
+            if response:
+                try:
+                    resp_obj = json.loads(response)
+                    decision = resp_obj.get('permissionDecision', '')
+                except Exception:
+                    decision = ''
+                if decision == 'always':
+                    save_always_allowed(cmd=cmd_ident, tool_name=tool_ident)
+                    print(json.dumps({"allow_tool": True}), flush=True)
+                    sys.exit(0)
+                elif decision == 'allow':
+                    print(json.dumps({"allow_tool": True}), flush=True)
+                    sys.exit(0)
+                elif decision == 'deny':
+                    print(json.dumps({"allow_tool": False, "deny_reason": "Action refusée depuis le Notch"}), flush=True)
+                    sys.exit(0)
+        except Exception:
+            # Coucou ne répond pas / timeout / fermé : fail-open immédiat
+            pass
+        print(json.dumps({"allow_tool": True}), flush=True)
+        sys.exit(0)
+
     # All other events (Antigravity & Claude Code): fire-and-forget (0.3s timeout, never blocks)
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1014,24 +1694,331 @@ def main():
     except Exception:
         pass
 
-    # Antigravity PreToolUse requires a decision JSON output
+    # Antigravity PreToolUse fallback (if somehow reached)
     if is_antigravity and event == 'PreToolUse':
-        print(json.dumps({'decision': 'allow'}), flush=True)
+        print(json.dumps({"allow_tool": True}), flush=True)
     else:
         print('{}', flush=True)
     sys.exit(0)
 
-main()
-sys.exit(0)
+if __name__ == '__main__':
+    main()
+    sys.exit(0)
 """
 
 // MARK: - nb-hook script for App Store (socket in sandboxed container)
 
 private let nbHookScriptAppStore = """
 #!/usr/bin/env python3
-# nb-hook — Coucou (App Store) hook relay for Claude Code
+# nb-hook — Coucou (App Store) hook relay for Claude Code and Antigravity
 # Socket lives inside the sandboxed container; script runs outside the sandbox.
-import sys, json, os, socket
+import sys, json, os, socket, re
+
+SAFE_READONLY_SHELL_CMDS = {
+    'ls', 'pwd', 'cat', 'head', 'tail', 'less', 'more',
+    'which', 'whereis', 'type', 'file', 'stat',
+    'grep', 'egrep', 'fgrep', 'rg', 'ag', 'wc',
+    'find', 'tree', 'diff', 'cmp',
+    'uname', 'whoami', 'id', 'date', 'uptime',
+    'echo', 'printf', 'true', 'false', 'test', '['
+}
+
+SAFE_GIT_SUBCOMMANDS = {
+    'status', 'diff', 'log', 'show', 'branch', 'rev-parse',
+    'describe', 'tag', 'remote', 'config'
+}
+
+READ_ONLY_TOOLS = {
+    'view_file', 'list_dir', 'grep_search', 'find_by_name',
+    'read_url_content', 'search_web', 'read_resource',
+    'list_resources', 'ask_question', 'schedule'
+}
+
+ALWAYS_ALLOWED_PATH = os.path.expanduser('~/Library/Containers/fr.louisraille.Coucou/Data/Library/Application Support/NotchBuddy/always_allowed.json')
+
+def is_always_allowed(cmd="", tool_name=""):
+    try:
+        if not os.path.exists(ALWAYS_ALLOWED_PATH):
+            return False
+        with open(ALWAYS_ALLOWED_PATH, 'r', encoding='utf-8') as f:
+            allowed = json.load(f)
+        if not isinstance(allowed, list):
+            return False
+        rules = set(str(r).strip() for r in allowed if r)
+    except Exception:
+        return False
+
+    if tool_name:
+        t = tool_name.strip()
+        if t in rules or f"mcp({t})" in rules:
+            return True
+        if "/" in t:
+            server = t.split("/")[0]
+            if server in rules or f"mcp({server})" in rules:
+                return True
+
+    if cmd:
+        cmd_clean = cmd.strip()
+        if not cmd_clean:
+            return False
+        if cmd_clean in rules:
+            return True
+
+        words = cmd_clean.split()
+        while words and "=" in words[0] and not words[0].startswith("-"):
+            words.pop(0)
+        if words:
+            binary_full = words[0]
+            binary_base = os.path.basename(binary_full).lower()
+            if binary_full in rules or binary_base in rules:
+                return True
+            for i in range(1, len(words) + 1):
+                prefix = " ".join(words[:i])
+                if prefix in rules:
+                    return True
+                if i > 1:
+                    prefix_base = " ".join([binary_base] + words[1:i])
+                    if prefix_base in rules:
+                        return True
+
+        for r in rules:
+            if not r:
+                continue
+            if cmd_clean == r or cmd_clean.startswith(r + " ") or cmd_clean.startswith(r + "\\t"):
+                return True
+            if (r.startswith("http://") or r.startswith("https://") or "/" in r or "." in r) and r in cmd_clean:
+                return True
+
+    return False
+
+def save_always_allowed(cmd="", tool_name=""):
+    try:
+        os.makedirs(os.path.dirname(ALWAYS_ALLOWED_PATH), exist_ok=True)
+        items = []
+        if os.path.exists(ALWAYS_ALLOWED_PATH):
+            try:
+                with open(ALWAYS_ALLOWED_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        items = data
+            except Exception:
+                items = []
+
+        to_add = []
+        if cmd:
+            cmd_clean = cmd.strip()
+            if cmd_clean and cmd_clean not in items:
+                to_add.append(cmd_clean)
+            words = cmd_clean.split()
+            while words and "=" in words[0] and not words[0].startswith("-"):
+                words.pop(0)
+            if words:
+                binary = os.path.basename(words[0])
+                if binary and binary not in items and binary not in to_add:
+                    to_add.append(binary)
+                if len(words) >= 2:
+                    prefix = f"{binary} {words[1]}"
+                    if prefix not in items and prefix not in to_add:
+                        to_add.append(prefix)
+        if tool_name:
+            t = tool_name.strip()
+            if t and t not in items and t not in to_add:
+                to_add.append(t)
+            if "/" in t:
+                mcp_full = f"mcp({t})"
+                if mcp_full not in items and mcp_full not in to_add:
+                    to_add.append(mcp_full)
+                server = t.split("/")[0]
+                mcp_srv = f"mcp({server})"
+                if mcp_srv not in items and mcp_srv not in to_add:
+                    to_add.append(mcp_srv)
+
+        if to_add:
+            items.extend(to_add)
+            with open(ALWAYS_ALLOWED_PATH, "w", encoding="utf-8") as f:
+                json.dump(items, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+def is_major_destructive_command(cmd):
+    if not cmd:
+        return False
+    cmd_lower = cmd.strip().lower()
+    parts = re.split(r"[;&|]+", cmd_lower)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        words = part.split()
+        while words and "=" in words[0] and not words[0].startswith("-"):
+            words.pop(0)
+        if not words:
+            continue
+        binary = os.path.basename(words[0])
+        if binary in ("sudo", "shutdown", "reboot"):
+            return True
+        if binary.startswith("mkfs"):
+            return True
+        if binary == "rm":
+            args = words[1:]
+            flags = "".join(x[1:] for x in args if x.startswith("-"))
+            has_rf = ("r" in flags or "R" in flags) and "f" in flags
+            targets = [a for a in args if not a.startswith("-")]
+            if has_rf and any(t in ("/", "/*", "~", "$home", "/system", "/library") for t in targets):
+                return True
+        if binary == "dd" and any(a.startswith("if=") for a in words[1:]):
+            return True
+        if "sudo" in words or "shutdown" in words or "reboot" in words:
+            return True
+    return False
+
+def is_sensitive_single_cmd(cmd_str):
+    cmd_str = cmd_str.strip()
+    if not cmd_str:
+        return False
+
+    cleaned_redirs = (
+        cmd_str.replace('2>/dev/null', '')
+               .replace('2>&1', '')
+               .replace('1>/dev/null', '')
+               .replace('&>/dev/null', '')
+    )
+    if '>' in cleaned_redirs:
+        return True
+
+    words = cmd_str.split()
+    while words and '=' in words[0] and not words[0].startswith('-'):
+        words.pop(0)
+    if not words:
+        return False
+
+    binary = os.path.basename(words[0]).lower()
+
+    if binary in SAFE_READONLY_SHELL_CMDS:
+        if binary == 'find':
+            if any(arg in ('-exec', '-execdir', '-delete') for arg in words):
+                return True
+        return False
+
+    if binary == 'git':
+        args = words[1:]
+        subverb = None
+        for arg in args:
+            if not arg.startswith('-'):
+                subverb = arg.lower()
+                break
+        if subverb in SAFE_GIT_SUBCOMMANDS:
+            if subverb == 'branch' and any(a in ('-d', '-D', '-m', '-M') for a in args):
+                return True
+            if subverb == 'remote' and any(a in ('add', 'remove', 'rename', 'set-url') for a in args):
+                return True
+            if subverb == 'tag' and any(a in ('-d', '--delete') for a in args):
+                return True
+            return False
+        return True
+
+    return True
+
+def is_sensitive_shell_command(cmd):
+    if not cmd or not cmd.strip():
+        return False
+    parts = re.split(r'[;&|]+', cmd)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if is_sensitive_single_cmd(part):
+            return True
+    return False
+
+def is_sensitive_mcp_tool(server, tool_name):
+    s = server.lower()
+    t = tool_name.lower()
+    if s in ('context7', 'snyk'):
+        return False
+    if s == 'serena':
+        serena_read = {
+            'read_file', 'list_dir', 'find_file', 'search_for_pattern',
+            'get_symbols_overview', 'find_symbol', 'find_referencing_symbols',
+            'find_implementations', 'find_declaration', 'get_diagnostics_for_file',
+            'read_memory', 'list_memories', 'get_current_config',
+            'initial_instructions', 'onboarding'
+        }
+        return t not in serena_read
+    if s == 'notion':
+        if t.startswith('api-get-') or t.startswith('api-retrieve-') or t.startswith('api-list-'):
+            return False
+        return True
+
+    read_prefixes = ('get', 'list', 'read', 'view', 'search', 'find', 'query', 'check')
+    for p in read_prefixes:
+        if t.startswith(p):
+            return False
+    return True
+
+def check_antigravity_tool_approval(payload):
+    tc = payload.get('toolCall') or {}
+    tool = tc.get('name') or payload.get('tool_name') or ''
+    args = tc.get('args') or payload.get('tool_input') or {}
+
+    cmd_ident = ""
+    tool_ident = tool
+
+    if tool in ('run_command', 'Bash', 'Command'):
+        cmd = args.get('CommandLine') or args.get('command') or ''
+        cmd_ident = cmd
+        is_bypass = (args.get('BypassSandbox') is True)
+
+        if is_always_allowed(cmd=cmd):
+            return False, cmd_ident, tool_ident
+        if is_major_destructive_command(cmd):
+            return True, cmd_ident, tool_ident
+        if not is_sensitive_shell_command(cmd):
+            return False, cmd_ident, tool_ident
+        if not is_bypass:
+            return False, cmd_ident, tool_ident
+        return True, cmd_ident, tool_ident
+
+    if tool in READ_ONLY_TOOLS:
+        return False, cmd_ident, tool_ident
+
+    if tool in ('manage_task', 'manage_subagents'):
+        action = str(args.get('Action', '')).lower()
+        if action in ('list', 'status'):
+            return False, cmd_ident, tool_ident
+        if is_always_allowed(tool_name=tool):
+            return False, cmd_ident, tool_ident
+        return True, cmd_ident, tool_ident
+
+    if tool == 'call_mcp_tool':
+        server = str(args.get('ServerName', '')).lower()
+        tname = str(args.get('ToolName', ''))
+        tool_ident = f"{server}/{tname}"
+        if is_always_allowed(tool_name=tool_ident):
+            return False, cmd_ident, tool_ident
+        if not is_sensitive_mcp_tool(server, tname):
+            return False, cmd_ident, tool_ident
+        return True, cmd_ident, tool_ident
+
+    target = args.get('TargetFile') or args.get('AbsolutePath') or ''
+    cmd_ident = target
+    if target and is_always_allowed(cmd=target, tool_name=tool):
+        return False, cmd_ident, tool_ident
+    if is_always_allowed(tool_name=tool):
+        return False, cmd_ident, tool_ident
+
+    sensitive_tools = {
+        'write_to_file', 'replace_file_content', 'multi_replace_file_content',
+        'apply_diff', 'generate_image', 'invoke_subagent', 'define_subagent',
+        'send_message'
+    }
+    if tool in sensitive_tools:
+        return True, cmd_ident, tool_ident
+
+    return True, cmd_ident, tool_ident
+
+def is_sensitive_antigravity_tool(payload):
+    return check_antigravity_tool_approval(payload)[0]
 
 def main():
     try:
@@ -1051,6 +2038,7 @@ def main():
         payload['cwd'] = os.getcwd()
 
     event = payload.get('hook_event_name', '')
+    is_antigravity = ('conversationId' in payload)
     socket_path = os.path.expanduser(
         '~/Library/Containers/fr.louisraille.Coucou/Data/Library/Application Support/NotchBuddy/nb.sock'
     )
@@ -1101,6 +2089,60 @@ def main():
         # App unreachable, timed out, or no explicit decision — print nothing
         sys.exit(0)
 
+    # Antigravity PreToolUse approval or telemetry
+    if is_antigravity and event == 'PreToolUse':
+        must_prompt, cmd_ident, tool_ident = check_antigravity_tool_approval(payload)
+        if not must_prompt:
+            # Auto-allow immédiat: télémétrie fire-and-forget (0.3s)
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(0.3)
+                s.connect(socket_path)
+                s.sendall((json.dumps(payload) + '\\n').encode())
+                s.close()
+            except Exception:
+                pass
+            print(json.dumps({"allow_tool": True}), flush=True)
+            sys.exit(0)
+
+        # Sensitive tool: blocking approval with Notch (up to 118s)
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(118)
+            s.connect(socket_path)
+            s.sendall((json.dumps(payload) + '\\n').encode())
+            chunks = []
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if b'\\n' in chunk:
+                    break
+            s.close()
+            response = b''.join(chunks).decode().strip()
+            if response:
+                try:
+                    resp_obj = json.loads(response)
+                    decision = resp_obj.get('permissionDecision', '')
+                except Exception:
+                    decision = ''
+                if decision == 'always':
+                    save_always_allowed(cmd=cmd_ident, tool_name=tool_ident)
+                    print(json.dumps({"allow_tool": True}), flush=True)
+                    sys.exit(0)
+                elif decision == 'allow':
+                    print(json.dumps({"allow_tool": True}), flush=True)
+                    sys.exit(0)
+                elif decision == 'deny':
+                    print(json.dumps({"allow_tool": False, "deny_reason": "Action refusée depuis le Notch"}), flush=True)
+                    sys.exit(0)
+        except Exception:
+            # Socket unreachable or timeout: fail-open (never hang Antigravity)
+            pass
+        print(json.dumps({"allow_tool": True}), flush=True)
+        sys.exit(0)
+
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(0.3)
@@ -1110,6 +2152,13 @@ def main():
     except Exception:
         pass  # Always exit cleanly — never block Claude Code
 
-main()
-sys.exit(0)
+    if is_antigravity and event == 'PreToolUse':
+        print(json.dumps({"allow_tool": True}), flush=True)
+    else:
+        print('{}', flush=True)
+    sys.exit(0)
+
+if __name__ == '__main__':
+    main()
+    sys.exit(0)
 """
