@@ -409,18 +409,29 @@ final class IslandWindowController: NSWindowController {
             Task { @MainActor in
                 guard let self = self else { return }
                 if self.state.view == .approval && self.state.pendingApproval != nil {
+                    let mouse = NSEvent.mouseLocation
+                    let isHoveringIsland = self.window?.frame.contains(mouse) ?? false
                     let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
-                    if event.keyCode == 53 || chars == "n" { // Escape or N -> Deny
+                    
+                    // Escape always dismisses/denies
+                    if event.keyCode == 53 {
                         HookServer.shared.sendApprovalDecision("deny")
                         return
                     }
-                    if event.keyCode == 36 || chars == "y" { // Return or Y -> Allow
-                        HookServer.shared.sendApprovalDecision("allow")
-                        return
-                    }
-                    if chars == "a" { // A -> Always
-                        HookServer.shared.sendApprovalDecision("always")
-                        return
+                    // Raw letter shortcuts (Y, N, A) only active when mouse is over the island to prevent hijacking typing in other apps
+                    if isHoveringIsland {
+                        if chars == "n" {
+                            HookServer.shared.sendApprovalDecision("deny")
+                            return
+                        }
+                        if event.keyCode == 36 || chars == "y" { // Return or Y
+                            HookServer.shared.sendApprovalDecision("allow")
+                            return
+                        }
+                        if chars == "a" {
+                            HookServer.shared.sendApprovalDecision("always")
+                            return
+                        }
                     }
                 }
                 if event.keyCode == 53 { // Escape

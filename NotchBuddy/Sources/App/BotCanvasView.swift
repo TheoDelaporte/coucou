@@ -27,8 +27,8 @@ struct BotCanvasView: View {
                     if engine.morph < 0.05 { engine.slotH = 0; engine.slotHVel = 0 }
                 }
                 // Integration pills have a fixed brand color → use it as bodyColor.
-                // Claude Code tasks use state-based gradient (working=blue, thinking=purple, etc.).
-                engine.bodyColor = (state.focusTask?.isIntegration == true)
+                // Claude Code and Antigravity tasks use state-based gradient (working=blue, thinking=purple, etc.).
+                engine.bodyColor = (state.focusTask?.isIntegration == true && state.focusTask?.source != .claudeCode && state.focusTask?.id != "integration_claude")
                     ? cgColorFromHex(state.focusTask!.color)
                     : nil
                 engine.update(dt: dt)
