@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+# nb-hook — Coucou hook relay for Claude Code and Antigravity
+# Reads JSON from stdin, forwards to Coucou via Unix socket, translates response.
+import sys, json, os, socket, re
+
+SAFE_READONLY_SHELL_CMDS = {
+    'ls', 'pwd', 'cat', 'head', 'tail', 'less', 'more',
+    'which', 'whereis', 'type', 'file', 'stat',
+    'grep', 'egrep', 'fgrep', 'rg', 'ag', 'wc',
+    'find', 'tree', 'diff', 'cmp',
+    'uname', 'whoami', 'id', 'date', 'uptime',
+    'echo', 'printf', 'true', 'false', 'test', '['
+}
+
+SAFE_GIT_SUBCOMMANDS = {
+    'status', 'diff', 'log', 'show', 'branch', 'rev-parse',
+    'describe', 'tag', 'remote', 'config'
+}
+
+READ_ONLY_TOOLS = {
+    'view_file', 'list_dir', 'grep_search', 'find_by_name',
+    'read_url_content', 'search_web', 'read_resource',
+    'list_resources', 'ask_question', 'schedule'
+}
+
+ALWAYS_ALLOWED_PATH = os.path.expanduser('~/Library/Application Support/NotchBuddy/always_allowed.json')
+
+def is_always_allowed(cmd="", tool_name=""):
+    try:
+        if not os.path.exists(ALWAYS_ALLOWED_PATH):
+            return False
+        with open(ALWAYS_ALLOWED_PATH, 'r', encoding='utf-8') as f:
+            allowed = json.load(f)
+        if not isinstance(allowed, list):
+            return False
+        rules = set(str(r).strip() for r in allowed if r)
+    except Exception:
+        return False
+
+    if tool_name:
+        t = tool_name.strip()
+        if t in rules or f"mcp({t})" in rules:
+            return True
+        if "/" in t:
+            server = t.split("/")[0]
+            if server in rules or f"mcp({server})" in rules:
+                return True
+
+    if cmd:
+        cmd_clean = cmd.strip()
+        if not cmd_clean:
+            return False
+        if cmd_clean in rules:
+            return True
+
+        words = cmd_clean.split()
+        while words and "=" in words[0] and not words[0].startswith("-"):
+            words.pop(0)
+        if words:
+            binary_full = words[0]
+            binary_base = os.path.basename(binary_full).lower()
+            if binary_full in rules or binary_base in rules:
+                return True
+            for i in range(1, len(words) + 1):
+                prefix = " ".join(words[:i])
+                if prefix in rules:
+                    return True
+                if i > 1:
+                    prefix_base = " ".join([binary_base] + words[1:i])
+                    if prefix_base in rules:
+                        return True
+
+        for r in rules:
+            if not r:
+                continue
+            if cmd_clean == r or cmd_clean.startswith(r + " ") or cmd_clean.startswith(r + "\t"):
+                return True
+            if (r.startswith("http://") or r.startswith("https://") or "/" in r or "." in r) and r in cmd_clean:
+                return True
+
+    return False
+
+def save_always_allowed(cmd="", tool_name=""):
+    try:
+        os.makedirs(os.path.dirname(ALWAYS_ALLOWED_PATH), exist_ok=True)
+        items = []
+        if os.path.exists(ALWAYS_ALLOWED_PATH):
+            try:
+                with open(ALWAYS_ALLOWED_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        items = data
+            except Exception:
+                items = []
+
+        to_add = []
+        if cmd:
+            cmd_clean = cmd.strip()
+            if cmd_clean and cmd_clean not in items:
+                to_add.append(cmd_clean)
+            words = cmd_clean.split()
+            while words and "=" in words[0] and not words[0].startswith("-"):
+                words.pop(0)
+            if words:
+                binary = os.path.basename(words[0])
+                if binary and binary not in items and binary not in to_add:
+                    to_add.append(binary)
+                if len(words) >= 2:
+                    prefix = f"{binary} {words[1]}"
+                    if prefix not in items and prefix not in to_add:
+                        to_add.append(prefix)
+        if tool_name:
+            t = tool_name.strip()
+            if t and t not in items and t not in to_add:
+                to_add.append(t)
+            if "/" in t:
+                mcp_full = f"mcp({t})"
+                if mcp_full not in items and mcp_full not in to_add:
+                    to_add.append(mcp_full)
+                server = t.split("/")[0]
+                mcp_srv = f"mcp({server})"
+                if mcp_srv not in items and mcp_srv not in to_add:
+                    to_add.append(mcp_srv)
+
+        if to_add:
+            items.extend(to_add)
+            with open(ALWAYS_ALLOWED_PATH, "w", encoding="utf-8") as f:
+                json.dump(items, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+def is_major_destructive_command(cmd):
+    if not cmd:
+        return False
+    cmd_lower = cmd.strip().lower()
+    parts = re.split(r"[;&|]+", cmd_lower)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        words = part.split()
+        while words and "=" in words[0] and not words[0].startswith("-"):
+            words.pop(0)
+        if not words:
+            continue
+        binary = os.path.basename(words[0])
+        if binary in ("sudo", "shutdown", "reboot"):
+            return True
+        if binary.startswith("mkfs"):
+            return True
+        if binary == "rm":
+            args = words[1:]
+            flags = "".join(x[1:] for x in args if x.startswith("-"))
+            has_rf = ("r" in flags or "R" in flags) and "f" in flags
+            targets = [a for a in args if not a.startswith("-")]
+            if has_rf and any(t in ("/", "/*", "~", "$home", "/system", "/library") for t in targets):
+                return True
+        if binary == "dd" and any(a.startswith("if=") for a in words[1:]):
+            return True
+        if "sudo" in words or "shutdown" in words or "reboot" in words:
+            return True
+    return False
+
+def is_sensitive_single_cmd(cmd_str):
+    cmd_str = cmd_str.strip()
+    if not cmd_str:
+        return False
+
+    cleaned_redirs = (
+        cmd_str.replace('2>/dev/null', '')
+               .replace('2>&1', '')
+               .replace('1>/dev/null', '')
+               .replace('&>/dev/null', '')
+    )
+    if '>' in cleaned_redirs:
+        return True
+
+    words = cmd_str.split()
+    while words and '=' in words[0] and not words[0].startswith('-'):
+        words.pop(0)
+    if not words:
+        return False
+
+    binary = os.path.basename(words[0]).lower()
+
+    if binary in SAFE_READONLY_SHELL_CMDS:
+        if binary == 'find':
+            if any(arg in ('-exec', '-execdir', '-delete') for arg in words):
+                return True
+        return False
+
+    if binary == 'git':
+        args = words[1:]
+        subverb = None
+        for arg in args:
+            if not arg.startswith('-'):
+                subverb = arg.lower()
+                break
+        if subverb in SAFE_GIT_SUBCOMMANDS:
+            if subverb == 'branch' and any(a in ('-d', '-D', '-m', '-M') for a in args):
+                return True
+            if subverb == 'remote' and any(a in ('add', 'remove', 'rename', 'set-url') for a in args):
+                return True
+            if subverb == 'tag' and any(a in ('-d', '--delete') for a in args):
+                return True
+            return False
+        return True
+
+    return True
+
+def is_sensitive_shell_command(cmd):
+    if not cmd or not cmd.strip():
+        return False
+    parts = re.split(r'[;&|]+', cmd)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if is_sensitive_single_cmd(part):
+            return True
+    return False
+
+def is_sensitive_mcp_tool(server, tool_name):
+    s = server.lower()
+    t = tool_name.lower()
+    if s in ('context7', 'snyk'):
+        return False
+    if s == 'serena':
+        serena_read = {
+            'read_file', 'list_dir', 'find_file', 'search_for_pattern',
+            'get_symbols_overview', 'find_symbol', 'find_referencing_symbols',
+            'find_implementations', 'find_declaration', 'get_diagnostics_for_file',
+            'read_memory', 'list_memories', 'get_current_config',
+            'initial_instructions', 'onboarding'
+        }
+        return t not in serena_read
+    if s == 'notion':
+        if t.startswith('api-get-') or t.startswith('api-retrieve-') or t.startswith('api-list-'):
+            return False
+        return True
+
+    read_prefixes = ('get', 'list', 'read', 'view', 'search', 'find', 'query', 'check')
+    for p in read_prefixes:
+        if t.startswith(p):
+            return False
+    return True
+
+def check_antigravity_tool_approval(payload):
+    tc = payload.get('toolCall') or {}
+    tool = tc.get('name') or payload.get('tool_name') or ''
+    args = tc.get('args') or payload.get('tool_input') or {}
+
+    cmd_ident = ""
+    tool_ident = tool
+
+    if tool in ('run_command', 'Bash', 'Command'):
+        cmd = args.get('CommandLine') or args.get('command') or ''
+        cmd_ident = cmd
+        is_bypass = (args.get('BypassSandbox') is True)
+
+        if is_always_allowed(cmd=cmd):
+            return False, cmd_ident, tool_ident
+        if is_major_destructive_command(cmd):
+            return True, cmd_ident, tool_ident
+        if not is_sensitive_shell_command(cmd):
+            return False, cmd_ident, tool_ident
+        if not is_bypass:
+            return False, cmd_ident, tool_ident
+        return True, cmd_ident, tool_ident
+
+    if tool in READ_ONLY_TOOLS:
+        return False, cmd_ident, tool_ident
+
+    if tool in ('manage_task', 'manage_subagents'):
+        action = str(args.get('Action', '')).lower()
+        if action in ('list', 'status'):
+            return False, cmd_ident, tool_ident
+        if is_always_allowed(tool_name=tool):
+            return False, cmd_ident, tool_ident
+        return True, cmd_ident, tool_ident
+
+    if tool == 'call_mcp_tool':
+        server = str(args.get('ServerName', '')).lower()
+        tname = str(args.get('ToolName', ''))
+        tool_ident = f"{server}/{tname}"
+        if is_always_allowed(tool_name=tool_ident):
+            return False, cmd_ident, tool_ident
+        if not is_sensitive_mcp_tool(server, tname):
+            return False, cmd_ident, tool_ident
+        return True, cmd_ident, tool_ident
+
+    target = args.get('TargetFile') or args.get('AbsolutePath') or ''
+    cmd_ident = target
+    if target and is_always_allowed(cmd=target, tool_name=tool):
+        return False, cmd_ident, tool_ident
+    if is_always_allowed(tool_name=tool):
+        return False, cmd_ident, tool_ident
+
+    sensitive_tools = {
+        'write_to_file', 'replace_file_content', 'multi_replace_file_content',
+        'apply_diff', 'generate_image', 'invoke_subagent', 'define_subagent',
+        'send_message'
+    }
+    if tool in sensitive_tools:
+        return True, cmd_ident, tool_ident
+
+    return True, cmd_ident, tool_ident
+
+def is_sensitive_antigravity_tool(payload):
+    return check_antigravity_tool_approval(payload)[0]
+
+def main():
+    try:
+        raw = sys.stdin.buffer.read()
+        if not raw:
+            return
+        payload = json.loads(raw)
+    except Exception:
+        return
+
+    # Project CWD resolution
+    if 'workspacePaths' in payload and payload['workspacePaths']:
+        payload['cwd'] = payload['workspacePaths'][0]
+    elif 'cwd' not in payload or not payload['cwd']:
+        payload['cwd'] = os.getcwd()
+
+    event = payload.get('hook_event_name', '')
+    if not event and len(sys.argv) > 1:
+        event = sys.argv[1]
+    payload['hook_event_name'] = event
+
+    # Enrich with terminal / IDE context
+    env = os.environ
+    payload.setdefault('term_program', env.get('TERM_PROGRAM', 'antigravity'))
+    payload.setdefault('iterm_session_id', env.get('ITERM_SESSION_ID', ''))
+    payload.setdefault('term_session_id', env.get('TERM_SESSION_ID', ''))
+    payload.setdefault('bundle_id', env.get('__CFBundleIdentifier', 'com.google.antigravity'))
+
+    if event == 'PreInvocation' and ('prompt' not in payload or not payload['prompt']):
+        t_path = payload.get('transcriptPath')
+        if t_path and os.path.exists(t_path):
+            try:
+                with open(t_path, 'r', encoding='utf-8') as f:
+                    for line in reversed(f.readlines()):
+                        entry = json.loads(line)
+                        if entry.get('source') == 'USER_EXPLICIT' or entry.get('type') == 'USER_INPUT':
+                            content = entry.get('content', '')
+                            if '<USER_REQUEST>' in content:
+                                content = content.split('<USER_REQUEST>')[1].split('</USER_REQUEST>')[0].strip()
+                            payload['prompt'] = content
+                            break
+            except Exception:
+                pass
+
+    is_antigravity = ('conversationId' in payload)
+
+    socket_dir = os.path.expanduser('~/Library/Application Support/NotchBuddy')
+    socket_path = os.path.join(socket_dir, 'nb.sock')
+
+    # Claude Code: blocking approval flow for PermissionRequest (up to 115s)
+    if event == 'PermissionRequest':
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(115)
+            s.connect(socket_path)
+            s.sendall(json.dumps(payload).encode() + b'\n')
+            chunks = []
+            while True:
+                chunk = s.recv(4096)
+                if not chunk: break
+                chunks.append(chunk)
+                if 10 in chunk: break
+            s.close()
+            response = b''.join(chunks).decode().strip()
+            if response:
+                try:
+                    resp_obj = json.loads(response)
+                    decision = resp_obj.get('permissionDecision', '')
+                except Exception:
+                    decision = ''
+                if decision == 'allow':
+                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow'}}}
+                    print(json.dumps(out), flush=True)
+                    sys.exit(0)
+                elif decision == 'always':
+                    suggestions = payload.get('permission_suggestions', [])
+                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow', 'updatedPermissions': suggestions}}}
+                    print(json.dumps(out), flush=True)
+                    sys.exit(0)
+                elif decision == 'deny':
+                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'deny', 'message': 'Denied from Coucou'}}}
+                    print(json.dumps(out), flush=True)
+                    sys.exit(0)
+        except Exception:
+            pass
+        sys.exit(0)
+
+    # Antigravity PreToolUse approval or telemetry
+    if is_antigravity and event == 'PreToolUse':
+        must_prompt, cmd_ident, tool_ident = check_antigravity_tool_approval(payload)
+        if not must_prompt:
+            # Auto-allow immédiat: télémétrie fire-and-forget (0.3s) pour animer Mochi ("working")
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(0.3)
+                s.connect(socket_path)
+                s.sendall(json.dumps(payload).encode() + b'\n')
+                s.close()
+            except Exception:
+                pass
+            print(json.dumps({"allow_tool": True}), flush=True)
+            sys.exit(0)
+
+        # Prompt Notch: ouverture socket 115s pour demander l'accord dans le Notch
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(115)
+            s.connect(socket_path)
+            s.sendall(json.dumps(payload).encode() + b'\n')
+            chunks = []
+            while True:
+                chunk = s.recv(4096)
+                if not chunk: break
+                chunks.append(chunk)
+                if 10 in chunk: break
+            s.close()
+            response = b''.join(chunks).decode().strip()
+            if response:
+                try:
+                    resp_obj = json.loads(response)
+                    decision = resp_obj.get('permissionDecision', '')
+                except Exception:
+                    decision = ''
+                if decision == 'always':
+                    save_always_allowed(cmd=cmd_ident, tool_name=tool_ident)
+                    print(json.dumps({"allow_tool": True}), flush=True)
+                    sys.exit(0)
+                elif decision == 'allow':
+                    print(json.dumps({"allow_tool": True}), flush=True)
+                    sys.exit(0)
+                elif decision == 'deny':
+                    print(json.dumps({"allow_tool": False, "deny_reason": "Action refusée depuis le Notch"}), flush=True)
+                    sys.exit(0)
+        except Exception:
+            # Coucou ne répond pas / timeout / fermé : fail-open immédiat
+            pass
+        print(json.dumps({"allow_tool": True}), flush=True)
+        sys.exit(0)
+
+    # All other events (Antigravity & Claude Code): fire-and-forget (0.3s timeout, never blocks)
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.3)
+        s.connect(socket_path)
+        s.sendall(json.dumps(payload).encode() + b'\n')
+        s.close()
+    except Exception:
+        pass
+
+    # Antigravity PreToolUse fallback (if somehow reached)
+    if is_antigravity and event == 'PreToolUse':
+        print(json.dumps({"allow_tool": True}), flush=True)
+    else:
+        print('{}', flush=True)
+    sys.exit(0)
+
+if __name__ == '__main__':
+    main()
+    sys.exit(0)
