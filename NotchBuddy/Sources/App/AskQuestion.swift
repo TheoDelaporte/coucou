@@ -56,18 +56,25 @@ struct AskQuestion: Equatable {
               !rawQs.isEmpty, rawQs.count <= 4 else { return nil }
         var items: [AskQuestionItem] = []
         for raw in rawQs {
-            guard let question = raw["question"] as? String, !question.isEmpty,
-                  let rawOpts = raw["options"] as? [[String: Any]],
-                  rawOpts.count >= 2, rawOpts.count <= 4 else { return nil }
+            guard let question = raw["question"] as? String, !question.isEmpty else { return nil }
             var opts: [AskQuestionOption] = []
-            for opt in rawOpts {
-                guard let label = opt["label"] as? String, !label.isEmpty else { return nil }
-                let desc = opt["description"] as? String ?? ""
-                opts.append(AskQuestionOption(label: label, description: desc))
+            if let strOpts = raw["options"] as? [String], strOpts.count >= 2, strOpts.count <= 6 {
+                for label in strOpts {
+                    opts.append(AskQuestionOption(label: label, description: ""))
+                }
+            } else if let rawOpts = raw["options"] as? [[String: Any]], rawOpts.count >= 2, rawOpts.count <= 6 {
+                for opt in rawOpts {
+                    guard let label = opt["label"] as? String, !label.isEmpty else { continue }
+                    let desc = opt["description"] as? String ?? ""
+                    opts.append(AskQuestionOption(label: label, description: desc))
+                }
+            } else {
+                return nil
             }
+            guard opts.count >= 2 else { return nil }
             let rawHeader = raw["header"] as? String ?? ""
             let header = String(rawHeader.prefix(12))
-            let multi = raw["multiSelect"] as? Bool ?? false
+            let multi = (raw["multiSelect"] as? Bool) ?? (raw["is_multi_select"] as? Bool) ?? false
             items.append(AskQuestionItem(question: question, header: header, options: opts, multiSelect: multi))
         }
         return AskQuestion(questions: items)
