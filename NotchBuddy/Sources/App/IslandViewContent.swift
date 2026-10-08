@@ -402,20 +402,38 @@ struct QuestionView: View {
                 let canProceed = !curSel.isEmpty || (curOther && !curOtherText.isEmpty)
 
                 VStack(alignment: .leading, spacing: 4) {
-                    // Header row: agent name + question counter + "Reply in terminal" link
+                    // Header row: agent name + question counter + action
+                    let isAntigravity = state.focusTask?.id == "agent_antigravity" || state.tasks.contains(where: { $0.id == "agent_antigravity" })
+                    let agentName = isAntigravity ? "Antigravity" : (state.focusTask?.name ?? "Claude Code")
                     HStack(spacing: 4) {
-                        AgentWho(task: nil, label: "Claude Code is asking")
+                        AgentWho(task: state.focusTask, label: "\(agentName) is asking")
                         Spacer(minLength: 4)
                         if q.questions.count > 1 {
                             Text("\(qi + 1)/\(q.questions.count)")
                                 .font(.system(size: 10))
                                 .foregroundColor(Color(hex: "#6B7079"))
                         }
-                        Button("Reply in terminal") { HookServer.shared.sendQuestionAsk() }
+                        if isAntigravity {
+                            Button("Open Antigravity") {
+                                let ids = ["com.google.antigravity", "com.google.antigravity-ide"]
+                                if let app = ids.compactMap({ id in NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == id }) }).first {
+                                    app.activate(options: .activateIgnoringOtherApps)
+                                } else if FileManager.default.fileExists(atPath: "/Applications/Antigravity.app") {
+                                    NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Antigravity.app"))
+                                }
+                                NotificationCenter.default.post(name: .islandCollapse, object: nil)
+                            }
                             .buttonStyle(.plain)
                             .font(.system(size: 10))
-                            .foregroundColor(Color(hex: "#6B7079"))
+                            .foregroundColor(Color(hex: "#22D3EE"))
                             .underline()
+                        } else {
+                            Button("Reply in terminal") { HookServer.shared.sendQuestionAsk() }
+                                .buttonStyle(.plain)
+                                .font(.system(size: 10))
+                                .foregroundColor(Color(hex: "#6B7079"))
+                                .underline()
+                        }
                     }
                     // Optional short header label above question text
                     if !item.header.isEmpty {
@@ -534,6 +552,32 @@ struct QuestionView: View {
                         }
                         .disabled(!canProceed)
                         .opacity(canProceed ? 1 : 0.4)
+                    }
+                }
+                .padding(.leading, 116)
+                .padding(.trailing, 16)
+                .padding(.vertical, 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                VStack(alignment: .leading, spacing: 5) {
+                    AgentWho(task: state.focusTask, label: "Antigravity is asking")
+                    Text(state.focusTask?.steps.last(where: { !$0.isDiffStep }) ?? "A question requires your attention.")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(Color(hex: "#F5F6F8"))
+                        .lineLimit(2)
+                    HStack(spacing: 8) {
+                        PrimaryButton("Open Antigravity") {
+                            let ids = ["com.google.antigravity", "com.google.antigravity-ide"]
+                            if let app = ids.compactMap({ id in NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == id }) }).first {
+                                app.activate(options: .activateIgnoringOtherApps)
+                            } else if FileManager.default.fileExists(atPath: "/Applications/Antigravity.app") {
+                                NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Antigravity.app"))
+                            }
+                            NotificationCenter.default.post(name: .islandCollapse, object: nil)
+                        }
+                        SecondaryButton("OK") {
+                            NotificationCenter.default.post(name: .islandCollapse, object: nil)
+                        }
                     }
                 }
                 .padding(.leading, 116)

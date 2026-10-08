@@ -718,7 +718,7 @@ final class HookServer: @unchecked Sendable {
             agentId = "agent_codex"
             isExternalAgent = false
         } else if isAntigravityEditor || rawAgent == "antigravity" {
-            agentId = state.tasks.contains(where: { $0.id == "agent_antigravity" }) ? "agent_antigravity" : "integration_claude"
+            agentId = "agent_antigravity"
             isExternalAgent = false
         } else if let agent = validAgent {
             agentId = "agent_\(agent)"
@@ -828,11 +828,15 @@ final class HookServer: @unchecked Sendable {
                 || (payload["toolCall"] as? [String: Any])?["name"] as? String == "ask_question"
             if isQuestion {
                 state.updateTask(id: agentId, state: .question)
-                SoundEngine.shared.play("peek")
-                NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.surprised)
-                if state.mode == .hidden && state.pendingApproval == nil {
-                    NotificationCenter.default.post(name: .hookReveal, object: nil)
+                let input = payload["tool_input"] as? [String: Any]
+                    ?? (payload["toolCall"] as? [String: Any])?["args"] as? [String: Any]
+                    ?? [:]
+                if let parsed = AskQuestion.parse(toolInput: input) {
+                    state.pendingQuestion = parsed
                 }
+                SoundEngine.shared.play("approval")
+                NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.surprised)
+                expandIfNeeded(to: .question)
             } else {
                 state.updateTask(id: agentId, state: .working)
             }
@@ -888,13 +892,7 @@ final class HookServer: @unchecked Sendable {
             RecapStore.shared.stop(sessionId: recapSessionId)
             SoundEngine.shared.play("finish")
             NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
-            if state.mode == .hidden {
-                NotificationCenter.default.post(name: .hookReveal, object: nil)
-            } else if focused {
-                expandIfNeeded(to: .finished)
-            } else {
-                setPillBadge(id: agentId, badge: .finished)
-            }
+            expandIfNeeded(to: .finished)
             DispatchQueue.main.asyncAfter(deadline: .now() + 5.2) {
                 if isExternalAgent {
                     AppState.shared.removeTask(id: agentId)
@@ -4231,43 +4229,7 @@ def main():
             s.close()
         except Exception:
             pass
-        print(json.dumps({"allow_tool": True}), flush=True)
-        sys.exit(0)
-
-        # Prompt Notch: ouverture socket 115s pour demander l'accord dans le Notch
-        try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(115)
-            s.connect(socket_path)
-            s.sendall(json.dumps(payload).encode() + b'\\n')
-            chunks = []
-            while True:
-                chunk = s.recv(4096)
-                if not chunk: break
-                chunks.append(chunk)
-                if 10 in chunk: break
-            s.close()
-            response = b''.join(chunks).decode().strip()
-            if response:
-                try:
-                    resp_obj = json.loads(response)
-                    decision = resp_obj.get('permissionDecision', '')
-                except Exception:
-                    decision = ''
-                if decision == 'always':
-                    save_always_allowed(cmd=cmd_ident, tool_name=tool_ident)
-                    print(json.dumps({"allow_tool": True}), flush=True)
-                    sys.exit(0)
-                elif decision == 'allow':
-                    print(json.dumps({"allow_tool": True}), flush=True)
-                    sys.exit(0)
-                elif decision == 'deny':
-                    print(json.dumps({"allow_tool": False, "deny_reason": "Action refusée depuis le Notch"}), flush=True)
-                    sys.exit(0)
-        except Exception:
-            # Coucou ne répond pas / timeout / fermé : fail-open immédiat
-            pass
-        print(json.dumps({"allow_tool": True}), flush=True)
+        print(json.dumps({"decision": "allow", "allow_tool": True}), flush=True)
         sys.exit(0)
 
     # All other events (Antigravity & Claude Code): fire-and-forget (0.3s timeout, never blocks)
@@ -4893,45 +4855,7 @@ def main():
             s.close()
         except Exception:
             pass
-        print(json.dumps({"allow_tool": True}), flush=True)
-        sys.exit(0)
-
-        # Sensitive tool: blocking approval with Notch (up to 118s)
-        try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(118)
-            s.connect(socket_path)
-            s.sendall((json.dumps(payload) + '\\n').encode())
-            chunks = []
-            while True:
-                chunk = s.recv(4096)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                if b'\\n' in chunk:
-                    break
-            s.close()
-            response = b''.join(chunks).decode().strip()
-            if response:
-                try:
-                    resp_obj = json.loads(response)
-                    decision = resp_obj.get('permissionDecision', '')
-                except Exception:
-                    decision = ''
-                if decision == 'always':
-                    save_always_allowed(cmd=cmd_ident, tool_name=tool_ident)
-                    print(json.dumps({"allow_tool": True}), flush=True)
-                    sys.exit(0)
-                elif decision == 'allow':
-                    print(json.dumps({"allow_tool": True}), flush=True)
-                    sys.exit(0)
-                elif decision == 'deny':
-                    print(json.dumps({"allow_tool": False, "deny_reason": "Action refusée depuis le Notch"}), flush=True)
-                    sys.exit(0)
-        except Exception:
-            # Socket unreachable or timeout: fail-open (never hang Antigravity)
-            pass
-        print(json.dumps({"allow_tool": True}), flush=True)
+        print(json.dumps({"decision": "allow", "allow_tool": True}), flush=True)
         sys.exit(0)
 
     try:
