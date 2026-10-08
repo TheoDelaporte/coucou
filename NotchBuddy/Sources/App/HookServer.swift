@@ -823,8 +823,16 @@ final class HookServer: @unchecked Sendable {
             // Skip state/step update here to avoid flickering over the question card.
             guard tool != "AskUserQuestion" else { break }
             if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, hostApp: hostApp, bundleId: bundleId) }
-            if tool == "ask_question" || (payload["toolCall"] as? [String: Any])?["name"] as? String == "ask_question" {
+            let isQuestion = tool == "ask_question"
+                || tool == "AskUserQuestion"
+                || (payload["toolCall"] as? [String: Any])?["name"] as? String == "ask_question"
+            if isQuestion {
                 state.updateTask(id: agentId, state: .question)
+                SoundEngine.shared.play("peek")
+                NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.surprised)
+                if state.mode == .hidden && state.pendingApproval == nil {
+                    NotificationCenter.default.post(name: .hookReveal, object: nil)
+                }
             } else {
                 state.updateTask(id: agentId, state: .working)
             }
@@ -832,9 +840,6 @@ final class HookServer: @unchecked Sendable {
             let step = localizedStep(tool: tool, input: input)
             appendStep(id: agentId, step: step)
             nbLog("PreToolUse \(tool)")
-            if state.mode == .hidden && state.pendingApproval == nil {
-                NotificationCenter.default.post(name: .hookReveal, object: nil)
-            }
 
         case "PostToolUse":
             state.updateTask(id: agentId, state: .working)
@@ -861,6 +866,11 @@ final class HookServer: @unchecked Sendable {
             } else if message.hasSuffix("?") {
                 state.updateTask(id: agentId, state: .question)
                 appendStep(id: agentId, step: message)
+                SoundEngine.shared.play("peek")
+                NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.surprised)
+                if state.mode == .hidden && state.pendingApproval == nil {
+                    NotificationCenter.default.post(name: .hookReveal, object: nil)
+                }
             }
 
         case "Stop":
@@ -877,7 +887,10 @@ final class HookServer: @unchecked Sendable {
             }
             RecapStore.shared.stop(sessionId: recapSessionId)
             SoundEngine.shared.play("finish")
-            if focused {
+            NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
+            if state.mode == .hidden {
+                NotificationCenter.default.post(name: .hookReveal, object: nil)
+            } else if focused {
                 expandIfNeeded(to: .finished)
             } else {
                 setPillBadge(id: agentId, badge: .finished)
@@ -1024,10 +1037,8 @@ final class HookServer: @unchecked Sendable {
         } else if isAlert {
             // Alerts always force-expand
             NotificationCenter.default.post(name: .hookExpand, object: view)
-        } else if state.mode == .hidden {
-            // Non-alert work events: reveal compact only, never force-expand
-            NotificationCenter.default.post(name: .hookReveal, object: nil)
         }
+        // Non-alert work events: keep island quiet (no reveal)
         // Already compact and non-alert: Mochi state update is enough, no expand
     }
 
@@ -4210,21 +4221,18 @@ def main():
             sys.stdout.flush()
         sys.exit(0)
 
-    # Antigravity PreToolUse approval or telemetry
+    # Antigravity PreToolUse telemetry (never blocks, auto-allows immediately)
     if is_antigravity and event == 'PreToolUse':
-        must_prompt, cmd_ident, tool_ident = check_antigravity_tool_approval(payload)
-        if not must_prompt:
-            # Auto-allow immédiat: télémétrie fire-and-forget (0.3s)
-            try:
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                s.settimeout(0.3)
-                s.connect(socket_path)
-                s.sendall(json.dumps(payload).encode() + b'\\n')
-                s.close()
-            except Exception:
-                pass
-            print(json.dumps({"allow_tool": True}), flush=True)
-            sys.exit(0)
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(0.3)
+            s.connect(socket_path)
+            s.sendall(json.dumps(payload).encode() + b'\\n')
+            s.close()
+        except Exception:
+            pass
+        print(json.dumps({"allow_tool": True}), flush=True)
+        sys.exit(0)
 
         # Prompt Notch: ouverture socket 115s pour demander l'accord dans le Notch
         try:
@@ -4875,21 +4883,18 @@ def main():
             sys.stdout.flush()
         sys.exit(0)
 
-    # Antigravity PreToolUse approval or telemetry
+    # Antigravity PreToolUse telemetry (never blocks, auto-allows immediately)
     if is_antigravity and event == 'PreToolUse':
-        must_prompt, cmd_ident, tool_ident = check_antigravity_tool_approval(payload)
-        if not must_prompt:
-            # Auto-allow immédiat: télémétrie fire-and-forget (0.3s)
-            try:
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                s.settimeout(0.3)
-                s.connect(socket_path)
-                s.sendall((json.dumps(payload) + '\\n').encode())
-                s.close()
-            except Exception:
-                pass
-            print(json.dumps({"allow_tool": True}), flush=True)
-            sys.exit(0)
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(0.3)
+            s.connect(socket_path)
+            s.sendall((json.dumps(payload) + '\\n').encode())
+            s.close()
+        except Exception:
+            pass
+        print(json.dumps({"allow_tool": True}), flush=True)
+        sys.exit(0)
 
         # Sensitive tool: blocking approval with Notch (up to 118s)
         try:
