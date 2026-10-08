@@ -17,14 +17,31 @@ final class IslandStateMachine {
     /// Fired on every transition: (from, to)
     var onTransition: ((State, State) -> Void)?
 
-    /// home → petit delay (seconds). Override for debug.
-    var homeToPetitDelay: TimeInterval = 15
+    /// When non-nil and returns true, timers and mouse-leave never auto-collapse or hide the island.
+    var isHeldOpen: (() -> Bool)?
+
+    /// home → petit delay (seconds), kept in sync with the auto-close preference.
+    var homeToPetitDelay: TimeInterval = 15 {
+        didSet {
+            guard homeToPetitDelay != oldValue,
+                  state == .home, homeCollapseWork != nil else { return }
+            scheduleHomeCollapse()
+        }
+    }
     /// petit → hidden delay (seconds). Override for debug.
     var petitToHiddenDelay: TimeInterval = 60
     /// coucou → petit delay after greeting animation ends (no hover). ~0.6s syncs with canvas collapse.
     var greetAutoCollapseDelay: TimeInterval = 0.6
     /// coucou → petit delay when mouse is hovering over the greeting.
     var greetHoverCollapseDelay: TimeInterval = 10
+
+    /// Opt-in (Settings → General → Behavior): hovering the island opens it, and an island
+    /// opened that way folds shortly after the pointer leaves. Off: hover only peeks (petit).
+    var openOnHover = false
+    /// Grace period after the pointer leaves a hover-opened island (no flicker at the edge).
+    var hoverCloseDelay: TimeInterval = 0.6
+    /// True while the island is open because of a hover, until the user clicks inside it.
+    private(set) var openedByHover = false
 
     private var petitHideWork: DispatchWorkItem?
     private var homeCollapseWork: DispatchWorkItem?
@@ -40,10 +57,21 @@ final class IslandStateMachine {
 
     /// Mouse entered the island notch area
     func mouseEntered() {
+        if openOnHover, state == .hidden || state == .petit, isHeldOpen?() != true {
+            cancelTimers()
+            openedByHover = true
+            transition(to: .home)
+            return
+        }
         switch state {
         case .hidden:
-            cancelTimers()
-            transition(to: .petit)
+            if isHeldOpen?() == true {
+                // Island already expanded by an external call — sync FSM state without transition
+                state = .home
+            } else {
+                cancelTimers()
+                transition(to: .petit)
+            }
         case .petit:
             petitHideWork?.cancel()
             petitHideWork = nil
@@ -64,16 +92,22 @@ final class IslandStateMachine {
         case .petit:
             schedulePetitHide()
         case .home:
-            scheduleHomeCollapse()
+            if isHeldOpen?() != true { scheduleHomeCollapse() }
         case .coucou:
-            // Interrupt greeting immediately → compact (overrides 10s auto-collapse)
-            greetCollapseWork?.cancel(); greetCollapseWork = nil
-            transition(to: .petit)
+            if isHeldOpen?() != true {
+                // Interrupt greeting immediately → compact (overrides 10s auto-collapse)
+                greetCollapseWork?.cancel(); greetCollapseWork = nil
+                transition(to: .petit)
+            }
         }
     }
 
-    /// Compact island clicked
+    /// Compact island clicked.
+    /// Also accepts `.hidden`: after an alert the island can be on screen while the
+    /// FSM never saw the mouse enter (it was already there), and the click must still open it.
     func click() {
+        openedByHover = false
+        guard state == .petit || state == .hidden else { return }
         cancelTimers()
         transition(to: .home)
     }
@@ -94,6 +128,35 @@ final class IslandStateMachine {
     func forceExpand() {
         cancelTimers()
         transition(to: .home)
+    }
+
+    /// The app hid the island on its own (e.g. `AppState.syncMode()` when the last
+    /// task ends). Mirror it without side effects, so the next hover peeks again
+    /// instead of being swallowed by a FSM that still thinks the island is `.petit`.
+    func hiddenExternally() {
+        guard state == .petit else { return }
+        cancelTimers()
+        state = .hidden
+    }
+
+    /// The app expanded the island externally (hookExpand for an alert).
+    /// Cancel timers and sync state to `.home` without firing `onTransition`, so the
+    /// next hover/mouseLeft behave correctly instead of collapsing the island.
+    func openedExternally() {
+        cancelTimers()
+        openedByHover = false
+        guard state != .home && state != .coucou else { return }
+        state = .home
+    }
+
+    /// The app folded the island itself (Escape, Settings, OK button, auto-close).
+    /// Move to `.petit` right away so hover and click keep working; waiting for the
+    /// 15 s home timer left the island compact on screen while the FSM still said `.home`.
+    func collapse() {
+        openedByHover = false
+        guard state == .home || state == .coucou else { return }
+        cancelTimers()
+        transition(to: .petit)
     }
 
     /// Greeting animation finished (called at T.end ≈ 4.60 s).
@@ -129,7 +192,7 @@ final class IslandStateMachine {
     private func schedulePetitHide() {
         petitHideWork?.cancel()
         let item = DispatchWorkItem { [weak self] in
-            guard let self, self.state == .petit else { return }
+            guard let self, self.state == .petit, !(self.isHeldOpen?() ?? false) else { return }
             self.transition(to: .hidden)
         }
         petitHideWork = item
@@ -139,11 +202,19 @@ final class IslandStateMachine {
     private func scheduleHomeCollapse() {
         homeCollapseWork?.cancel()
         let item = DispatchWorkItem { [weak self] in
-            guard let self, self.state == .home else { return }
+            guard let self, self.state == .home, !(self.isHeldOpen?() ?? false) else { return }
+            self.openedByHover = false
             self.transition(to: .petit)
         }
         homeCollapseWork = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + homeToPetitDelay, execute: item)
+        let delay = openedByHover ? hoverCloseDelay : homeToPetitDelay
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    /// The user clicked inside the island: a hover-opened island now stays like any open
+    /// island (normal auto-close) instead of folding as soon as the pointer leaves.
+    func userInteracted() {
+        openedByHover = false
     }
 
     func cancelTimers() {

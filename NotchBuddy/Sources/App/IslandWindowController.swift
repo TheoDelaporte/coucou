@@ -16,9 +16,15 @@ final class IslandWindowController: NSWindowController {
     private var keyMonitor: Any?
     private var viewSubscription: AnyCancellable?
     private var approvalSubscription: AnyCancellable?
+    private var displaySubscription: AnyCancellable?
+    private var autoCloseSubscription: AnyCancellable?
+    private var openOnHoverSubscription: AnyCancellable?
 
     // Confused recovery timer (set by handleDizzy)
     private var confusedRecoveryTimer: DispatchWorkItem?
+
+    // Suppress peek sound on next reveal (e.g. musicReveal)
+    var silentNextReveal = false
 
     // Finished-pin timer
     private var finishedPinTimer: DispatchWorkItem?
@@ -44,19 +50,20 @@ final class IslandWindowController: NSWindowController {
     private var notchW: CGFloat = IslandConst.notchWidth
     private var notchH: CGFloat = IslandConst.notchHeight
     private var currentScreen: NSScreen?
+    private var hasNotch = true
 
-    // Multi-screen / Nomad relocation timing & animation
-    private var screenRelocateTimer: DispatchWorkItem?
-    private var pendingRelocateScreen: NSScreen?
-    private var isRelocating: Bool = false
+    // Island-local key monitor (active only when island is key window)
+    private var localKeyMonitor: Any?
 
     convenience init() {
-        let screen = Self.targetScreen(for: NSEvent.mouseLocation)
-        let nW = Self.notchWidth(for: screen)
-        let nH = Self.notchHeight(for: screen)
+        let screen = Self.targetScreen(for: AppState.shared.islandDisplay)
+        Self.currentScreen = screen
+        let geometry = Self.screenGeometry(for: screen)
+        let nW = geometry.width
+        let nH = geometry.height
 
         let panelW: CGFloat = 720
-        let panelH: CGFloat = 320
+        let panelH: CGFloat = 560
         let sf = screen.frame
         let panel = IslandPanel(
             contentRect: NSRect(x: sf.midX - panelW/2, y: sf.maxY - panelH,
@@ -72,6 +79,7 @@ final class IslandWindowController: NSWindowController {
         self.currentScreen = screen
         self.notchW = nW
         self.notchH = nH
+        self.hasNotch = geometry.hasNotch
         setupPanel(screen: screen)
     }
 
@@ -90,14 +98,6 @@ final class IslandWindowController: NSWindowController {
         AppState.shared.screenWidth = screen.frame.width
         AppState.shared.hasPhysicalNotch = (screen.safeAreaInsets.top > 0)
 
-        // Observe screen configuration changes (e.g. DisplayLink dock connected/disconnected)
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleScreenParametersChanged),
-            name: NSApplication.didChangeScreenParametersNotification,
-            object: nil
-        )
-
         let contentSize = panel.contentRect(forFrameRect: panel.frame).size
 
         // Apple-recommended pattern: put NSHostingView and drag destination as siblings
@@ -105,7 +105,9 @@ final class IslandWindowController: NSWindowController {
         let container = NSView(frame: NSRect(origin: .zero, size: contentSize))
         container.autoresizingMask = [.width, .height]
 
-        let hosting = NSHostingView(rootView: IslandRootView().environmentObject(AppState.shared))
+        let hosting = NSHostingView(rootView: IslandRootView()
+            .environmentObject(AppState.shared)
+            .environment(\.layoutDirection, .leftToRight))
         hosting.frame = NSRect(origin: .zero, size: contentSize)
         hosting.autoresizingMask = [.width, .height]
 
@@ -150,6 +152,8 @@ final class IslandWindowController: NSWindowController {
 
         startPolling()
         startKeyMonitor()
+        startLocalKeyMonitor()
+        startHotKeys()
         wireFSM()
 
         // Make panel key whenever the prompt/chat view becomes active
@@ -170,11 +174,74 @@ final class IslandWindowController: NSWindowController {
                 guard let self, approval == nil, self.fsm.state == .home, !self.wasInIsland else { return }
                 self.fsm.mouseLeft()
             }
+        // Screen choice changed in Settings: move right away (explicit user action).
+        displaySubscription = state.$islandDisplay
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] choice in
+                self?.moveToTargetScreen(choice: choice)
+            }
+
+        // Screen plugged/unplugged, lid closed, arrangement or resolution changed.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.moveToTargetScreen(choice: AppState.shared.islandDisplay) }
+        }
+    }
+
+    // MARK: - Screen choice
+
+    private func moveToTargetScreen(choice: IslandDisplayChoice) {
+        guard !inAttachDrag, attachDragStart == nil else { return }
+        relocate(to: Self.targetScreen(for: choice))
+    }
+
+    /// Recomputes the resting geometry for `screen` and moves the panel to its top centre.
+    /// Always re-applied, even on the same screen: its menu bar or resolution may have changed.
+    private func relocate(to screen: NSScreen) {
+        guard let panel = window as? IslandPanel else { return }
+        let geometry = Self.screenGeometry(for: screen)
+        notchW = geometry.width
+        notchH = geometry.height
+        hasNotch = geometry.hasNotch
+        panel.notchWidth  = notchW
+        panel.notchHeight = notchH
+        AppState.shared.notchWidth  = notchW
+        AppState.shared.notchHeight = notchH
+        Self.currentScreen = screen
+
+        let sf = screen.frame
+        let size = panel.frame.size
+        panel.setFrame(NSRect(x: sf.midX - size.width/2, y: sf.maxY - size.height,
+                              width: size.width, height: size.height), display: true)
+        // notchWidth/hasNotch are not @Published: tell the views to resize the island.
+        NotificationCenter.default.post(name: .islandScreenChanged, object: nil)
+        state.objectWillChange.send()
+    }
+
+    /// Follow-the-mouse mode: hop to the cursor's screen while the island is not open,
+    /// so an approval or a chat never jumps away mid-click.
+    private func followMouseIfNeeded(_ mouse: NSPoint) {
+        guard state.islandDisplay == .followMouse,
+              state.mode != .expanded, !inAttachDrag, attachDragStart == nil else { return }
+        if let current = Self.currentScreen, current.frame.contains(mouse) { return }
+        guard let target = NSScreen.screens.first(where: { $0.frame.contains(mouse) }),
+              target != Self.currentScreen else { return }
+        relocate(to: target)
     }
 
     // MARK: - FSM wiring
 
     private func wireFSM() {
+        // Apply the persisted preference immediately and keep live edits in sync.
+        autoCloseSubscription = state.$autoCloseInterval.sink { [weak self] delay in
+            self?.fsm.homeToPetitDelay = delay
+        }
+        openOnHoverSubscription = state.$openOnHover.sink { [weak self] on in
+            self?.fsm.openOnHover = on
+        }
+
         fsm.onTransition = { [weak self] from, to in
             guard let self else { return }
             // A pending approval must stay visible until answered: bounce any collapse back to expanded
@@ -191,7 +258,11 @@ final class IslandWindowController: NSWindowController {
                     // Fire interrupt first so canvas collapse starts before mode change
                     NotificationCenter.default.post(name: .greetingInterrupt, object: nil)
                 } else if from == .hidden {
-                    SoundEngine.shared.play("peek")
+                    if self.silentNextReveal {
+                        self.silentNextReveal = false
+                    } else {
+                        SoundEngine.shared.play("peek")
+                    }
                 }
                 // setMode BEFORE changing view: onChange(of: state.view) guards on .expanded,
                 // so setting view while already compact won't trigger a spurious open animation.
@@ -218,35 +289,45 @@ final class IslandWindowController: NSWindowController {
         ) { [weak self] _ in
             self?.fsm.greetComplete()
         }
+
+        fsm.isHeldOpen = { AppState.shared.pendingApproval != nil }
     }
 
-    // MARK: - 60 Hz polling loop
+    // MARK: - Polling loop
+    // 60 Hz while the island is on screen, Mochi is on the desktop, a drag is under way or the
+    // pointer is near the island; 8 Hz (with timer tolerance) while it is hidden and the pointer
+    // is elsewhere, so a hidden island costs next to nothing (CLAUDE.md: 0 % CPU when hidden).
 
-    private func startPolling() {
-        frameTimer = Timer.scheduledTimer(withTimeInterval: 1.0/60.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            Task { @MainActor in self.pollFrame() }
+    private static let fastPoll: TimeInterval = 1.0 / 60.0
+    private static let idlePoll: TimeInterval = 1.0 / 8.0
+    private var pollInterval: TimeInterval = 0
+
+    private func startPolling(interval: TimeInterval = IslandWindowController.fastPoll) {
+        frameTimer?.invalidate()
+        pollInterval = interval
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            // Scheduled on the main run loop: already on the main actor, no Task per tick.
+            MainActor.assumeIsolated { self?.pollFrame() }
         }
-        RunLoop.main.add(frameTimer!, forMode: .common)
+        timer.tolerance = interval == Self.idlePoll ? 0.04 : 0
+        RunLoop.main.add(timer, forMode: .common)
+        frameTimer = timer
+    }
+
+    /// Picks the polling rate for the next ticks (see startPolling).
+    private func adjustPollRate(mouse: NSPoint, panelFrame: NSRect) {
+        let nearIsland = panelFrame.insetBy(dx: -120, dy: -120).contains(mouse)
+        let busy = state.mode != .hidden || state.mochiOnDesktop || inAttachDrag || attachDragStart != nil
+            || fsm.state != .hidden || nearIsland
+        let wanted = busy ? Self.fastPoll : Self.idlePoll
+        if wanted != pollInterval { startPolling(interval: wanted) }
     }
 
     private func pollFrame() {
         guard let panel = window as? IslandPanel else { return }
 
         let mouse = NSEvent.mouseLocation
-
-        // Nomad island: smoothly follow cursor to active screen with debounce + fade
-        if state.mode != .expanded && !inAttachDrag && attachDragStart == nil && !isRelocating {
-            let targetScreen = Self.targetScreen(for: mouse)
-            let activeScreen = currentScreen ?? panel.screen
-            if targetScreen != activeScreen {
-                scheduleNomadRelocation(to: targetScreen)
-            } else if pendingRelocateScreen != nil {
-                // Mouse returned to current screen before delay expired: cancel
-                screenRelocateTimer?.cancel()
-                pendingRelocateScreen = nil
-            }
-        }
+        followMouseIfNeeded(mouse)
 
         // Convert mouse to panel-local coords (macOS: origin bottom-left)
         let pf = panel.frame
@@ -254,7 +335,11 @@ final class IslandWindowController: NSWindowController {
 
         // Island rect in panel coords
         let islandRect = panel.currentIslandFrame(nw: notchW, nh: notchH)
-        let inIsland   = islandRect.insetBy(dx: -6, dy: -6).contains(local)
+        // On a screen without a notch, the resting bar must not intercept clicks
+        // in the app window immediately below the menu bar.
+        let hoverRect = !hasNotch && state.mode != .expanded
+            ? islandRect : islandRect.insetBy(dx: -6, dy: -6)
+        let inIsland = hoverRect.contains(local)
 
         // Toggle click-through
         let shouldAcceptMouse = (!state.isDND || state.mode != .hidden) && (inIsland || inAttachDrag || attachDragStart != nil)
@@ -265,33 +350,33 @@ final class IslandWindowController: NSWindowController {
             }
         }
 
-        // Mouse in screen coords (Y flipped, origin top-left) for Bot look-at
-        let activeScreen = panel.screen ?? currentScreen ?? NSScreen.main!
-        let screenOriginX = activeScreen.frame.minX
-        let screenMaxY = activeScreen.frame.maxY
-        let newPos = CGPoint(x: mouse.x - screenOriginX, y: screenMaxY - mouse.y)
+        // Mouse in desktop space (y-down from the menu-bar screen top) for Bot look-at
+        let newPos = DesktopSpace.topDown(mouse, desktopTop: Self.desktopTop)
         let cur = AppState.shared.mousePosition
         if abs(newPos.x - cur.x) > 1 || abs(newPos.y - cur.y) > 1 {
             AppState.shared.mousePosition = newPos
         }
 
+        // AppState can hide the island by itself (last task ended): keep the FSM in step.
+        if state.mode == .hidden && fsm.state == .petit { fsm.hiddenExternally() }
+
         // Feed FSM hover enter/leave
-        if inIsland && !wasInIsland {
-            guard !inAttachDrag else { wasInIsland = inIsland; return }
-            if state.isDND && state.mode == .hidden {
-                wasInIsland = inIsland
-                return
-            }
+        // Update the hit test before feeding the FSM: its transitions read wasInIsland
+        // (a hover-opened island must not start its close timer while the pointer is on it).
+        let previouslyInIsland = wasInIsland
+        wasInIsland = inIsland
+        if inIsland && !previouslyInIsland {
+            guard !inAttachDrag else { return }
+            if state.isDND && state.mode == .hidden { return }
             // If in coucou: tell greeting to stay open (tc → infinity)
             if fsm.state == .coucou {
                 NotificationCenter.default.post(name: .greetingHover, object: nil)
             }
             fsm.mouseEntered()
         }
-        if !inIsland && wasInIsland {
+        if !inIsland && previouslyInIsland {
             fsm.mouseLeft()
         }
-        wasInIsland = inIsland
 
         // Bot-head hover (love emote)
         let overBot = state.mode == .expanded && state.stateOverride == nil && isBotHit(local)
@@ -313,6 +398,8 @@ final class IslandWindowController: NSWindowController {
             updateDragGhost()
             updateWindowHighlight()
         }
+
+        adjustPollRate(mouse: mouse, panelFrame: pf)
     }
 
     private var lastMouse: CGPoint = .zero
@@ -369,11 +456,13 @@ final class IslandWindowController: NSWindowController {
             : .spring(response: 0.5, dampingFraction: 0.72)
         withAnimation(anim) { state.mode = mode }
         if mode == .expanded { SoundEngine.shared.play("open") }
-        if prev == .expanded { SoundEngine.shared.play("close"); state.isPinned = false }
+        if prev == .expanded {
+            SoundEngine.shared.play("close")
+            if fsm.isHeldOpen?() != true { state.isPinned = false }
+        }
     }
 
     func expand(to view: IslandView) {
-        relocateToCurrentFocusScreen()
         state.view = view
         if state.mode == .expanded {
             // Already expanded — just switch view
@@ -384,11 +473,13 @@ final class IslandWindowController: NSWindowController {
         window?.orderFrontRegardless()
     }
 
-    func collapse() {
-        pendingIslandClick = false
-        state.isPinned = false
+    func collapse(allowPendingApproval: Bool = false) {
+        let keepsApprovalPending = allowPendingApproval && state.pendingApproval != nil
+        guard fsm.isHeldOpen?() != true || keepsApprovalPending else { return }
+        if !keepsApprovalPending { state.isPinned = false }
         finishedPinTimer?.cancel()
-        fsm.forceCollapse()
+        // Keep the FSM in step with what is on screen (home/coucou → petit now).
+        fsm.collapse()
         setMode(.compact)
         window?.resignKey()
     }
@@ -401,6 +492,204 @@ final class IslandWindowController: NSWindowController {
         setMode(.hidden)
         window?.resignKey()
     }
+
+    // MARK: - Global hot keys (Carbon)
+
+    private func startHotKeys() {
+        HotKeyCenter.shared.start { [weak self] action in
+            self?.handleHotKey(action)
+        }
+    }
+
+    func handleHotKey(_ action: ShortcutAction) {
+        switch action {
+        case .toggleIsland:
+            if state.mode == .expanded {
+                collapse(allowPendingApproval: true)
+            } else {
+                islandPanel.makeKey()
+                fsm.openedExternally()
+                expand(to: defaultView())
+            }
+
+        case .openChat:
+            islandPanel.makeKey()
+            expand(to: .prompt)
+
+        case .goToAlert:
+            if state.pendingApproval != nil {
+                islandPanel.makeKey()
+                fsm.openedExternally()
+                expand(to: .approval)
+            } else if state.pendingQuestion != nil {
+                islandPanel.makeKey()
+                expand(to: .question)
+            } else {
+                NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.annoyed)
+                SoundEngine.shared.play("error")
+            }
+
+        case .jumpToTerminal:
+            #if !APPSTORE
+            performJumpToTerminal()
+            #endif
+
+        case .attachFrontWindow:
+            #if !APPSTORE
+            performAttachFrontWindow()
+            #endif
+
+        case .nextPill:
+            cyclePill(by: +1)
+
+        case .prevPill:
+            cyclePill(by: -1)
+
+        case .muteToggle:
+            state.soundEnabled.toggle()
+            if state.soundEnabled { SoundEngine.shared.play("tick") }
+            NotificationCenter.default.post(
+                name: .triggerEmote,
+                object: state.soundEnabled ? BotEmote.happy : BotEmote.annoyed)
+
+        case .desktopToggle:
+            DesktopMochiController.shared.flyOutOrHome()
+
+        case .wardrobeToggle:
+            if state.mode == .expanded && state.view == .wardrobe {
+                collapse()
+            } else {
+                islandPanel.makeKey()
+                expand(to: .wardrobe)
+            }
+        }
+    }
+
+    // MARK: - Island-local shortcuts
+
+    private func startLocalKeyMonitor() {
+        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.islandPanel.isKeyWindow else { return event }
+            return self.handleIslandKey(event) ? nil : event
+        }
+    }
+
+    @discardableResult
+    private func handleIslandKey(_ event: NSEvent) -> Bool {
+        let raw = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        let cmd = raw == .command
+
+        // ⌘→ — next pill
+        if cmd && event.keyCode == 124 { cyclePill(by: +1); return true }
+        // ⌘← — previous pill
+        if cmd && event.keyCode == 123 { cyclePill(by: -1); return true }
+        // ⌘↓ — navigate list down
+        if cmd && event.keyCode == 125 { navigateCard(by: +1); return true }
+        // ⌘↑ — navigate list up
+        if cmd && event.keyCode == 126 { navigateCard(by: -1); return true }
+        // ⌘O — open selected card item
+        if cmd && event.keyCode == 31  { openCardSelection(); return true }
+        // ⌘E — toggle diff
+        if cmd && event.keyCode == 14 && state.view == .overview {
+            NotificationCenter.default.post(name: .islandToggleDiff, object: nil)
+            return true
+        }
+        // ⌘↩ — send chat message
+        if cmd && event.keyCode == 36 && state.view == .prompt {
+            NotificationCenter.default.post(name: .islandSendMessage, object: nil)
+            return true
+        }
+        // ⌘K — new conversation
+        if cmd && event.keyCode == 40 && state.view == .prompt {
+            NotificationCenter.default.post(name: .islandNewConversation, object: nil)
+            return true
+        }
+        // ⌘, — open Settings
+        if cmd && event.keyCode == 43 {
+            NotificationCenter.default.post(name: .openFullSettings, object: nil)
+            return true
+        }
+        // ⌘P — pin / unpin
+        if cmd && event.keyCode == 35 {
+            state.isPinned.toggle()
+            return true
+        }
+        // ⌘1–⌘9 — switch to pill by number
+        let digitCodes: [UInt16: Int] = [18:1,19:2,20:3,21:4,23:5,22:6,26:7,28:8,25:9]
+        if cmd, let n = digitCodes[event.keyCode] {
+            switchToPill(number: n); return true
+        }
+        // ⎋ Escape — focused views (.onExitCommand) have first crack; fall back to collapse
+        if event.keyCode == 53 && raw.isEmpty {
+            let consumed = NSApp.sendAction(Selector(("cancelOperation:")), to: nil, from: nil)
+            let canCollapse = !state.isPinned || state.pendingApproval != nil
+            if !consumed && state.mode == .expanded && canCollapse {
+                collapse(allowPendingApproval: true)
+            }
+            return true
+        }
+        return false
+    }
+
+    // MARK: - Pill cycling helpers
+
+    private func cyclePill(by delta: Int) {
+        guard !state.tasks.isEmpty else { return }
+        let ids = state.tasks.map { $0.id }
+        let cur = ids.firstIndex(of: state.focusId ?? "") ?? 0
+        state.setFocus(ids[(cur + delta + ids.count) % ids.count])
+        state.cardSelection = nil
+        expand(to: .overview)
+    }
+
+    private func switchToPill(number: Int) {
+        guard number >= 1, number <= state.tasks.count else { return }
+        state.setFocus(state.tasks[number - 1].id)
+        state.cardSelection = nil
+        expand(to: .overview)
+    }
+
+    private func navigateCard(by delta: Int) {
+        guard state.cardItemCount > 0 else { return }
+        state.cardSelection = ShortcutLogic.navigate(
+            selection: state.cardSelection, delta: delta, itemCount: state.cardItemCount)
+    }
+
+    private func openCardSelection() {
+        guard state.cardSelection != nil else { return }
+        NotificationCenter.default.post(name: .islandActivateCardSelection, object: nil)
+    }
+
+    // MARK: - Terminal jump
+
+    #if !APPSTORE
+    private func performJumpToTerminal() {
+        guard state.focusTask != nil else {
+            SoundEngine.shared.play("error")
+            NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.annoyed)
+            return
+        }
+        if !TerminalTarget.activate(sessionBundleId: state.focusTask?.sessionBundleId) {
+            NSWorkspace.shared.open(
+                URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"))
+        }
+        collapse(allowPendingApproval: true)
+    }
+
+    private func performAttachFrontWindow() {
+        guard let app = state.lastExternalApp else {
+            SoundEngine.shared.play("error"); return
+        }
+        guard let ctx = WindowContextCapture.captureActive(from: app) else {
+            SoundEngine.shared.play("error"); return
+        }
+        state.promptContext = ctx
+        SoundEngine.shared.play("approve")
+        NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
+        islandPanel.makeKey()
+        expand(to: .prompt)
+    }
+    #endif
 
     // MARK: - Keyboard (Escape closes)
 
@@ -435,6 +724,8 @@ final class IslandWindowController: NSWindowController {
                     }
                 }
                 if event.keyCode == 53 { // Escape
+                    // Escape typed in another app (Claude Code's own interrupt, an editor…)
+                    // never folds a pending approval away: only Escape in the notch does.
                     if self.state.mode == .expanded && !self.state.isPinned {
                         self.collapse()
                     }
@@ -466,7 +757,8 @@ final class IslandWindowController: NSWindowController {
         NotificationCenter.default.addObserver(forName: .hookExpand, object: nil, queue: .main) { [weak self] note in
             guard let self, let view = note.object as? IslandView else { return }
             guard !self.state.isDND else { return }
-            if view == .approval { self.fsm.forceExpand() }  // keep FSM in sync (else its timers collapse the island)
+            self.fsm.openedExternally()
+            if view == .approval { self.fsm.forceExpand() }
             self.expand(to: view)
         }
 
@@ -474,8 +766,15 @@ final class IslandWindowController: NSWindowController {
         NotificationCenter.default.addObserver(forName: .hookReveal, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
             guard !self.state.isDND else { return }
-            self.relocateToCurrentFocusScreen()
             self.fsm.reveal()
+        }
+
+        // Music started playing: reveal silently (no peek sound)
+        NotificationCenter.default.addObserver(forName: .musicReveal, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            self.silentNextReveal = true
+            self.fsm.reveal()
+            self.silentNextReveal = false
         }
 
         // Collapse requests from views (OK button, etc.)
@@ -486,6 +785,18 @@ final class IslandWindowController: NSWindowController {
         // Hide requests from views or DND
         NotificationCenter.default.addObserver(forName: .islandHide, object: nil, queue: .main) { [weak self] _ in
             self?.hide()
+        }
+
+        // Wardrobe open/close from desktop Mochi right-click (does NOT post .hookExpand)
+        NotificationCenter.default.addObserver(forName: .openWardrobeFromDesktop, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            if self.state.mode == .expanded && self.state.view == .wardrobe {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                    self.state.view = .overview
+                }
+            } else {
+                self.expand(to: .wardrobe)
+            }
         }
 
         // .botDizzy — posted by BotEngine.slap() on 3rd hit; show confused view + recover after 3.3s
@@ -500,12 +811,15 @@ final class IslandWindowController: NSWindowController {
             guard let self else { return event }
             MainActor.assumeIsolated {
                 guard self.wasInIsland else { return }
+                self.fsm.userInteracted()
                 self.pendingIslandClick = true
                 self.hoverTimer?.cancel()
                 self.botHoverTimer?.cancel()
                 self.botHovering = false
                 // Drag only starts when clicking directly on the bot head
                 guard self.isBotHit(event.locationInWindow) else { return }
+                // Notch Mochi is invisible when on desktop — no drag, no slap
+                guard !self.state.mochiOnDesktop else { return }
                 self.attachDragStart = NSEvent.mouseLocation
                 // Post slap only when expanded
                 guard self.state.mode == .expanded else { return }
@@ -534,13 +848,38 @@ final class IslandWindowController: NSWindowController {
                 self.inAttachDrag = false
                 self.attachDragStart = nil
                 self.state.stateOverride = nil
-                self.hideDragGhost()
+
                 #if !APPSTORE
-                if let ctx = self.windowContextAtPoint(mouse) {
+                let windowCtx = self.windowContextAtPoint(mouse)
+                let inNotchZone = self.window?.frame.contains(mouse) == true
+
+                if let ctx = windowCtx {
+                    // Drop on a window → attach context as before
+                    self.hideDragGhost()
                     self.state.promptContext = ctx
                     SoundEngine.shared.play("approve")
                     NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
                     self.expand(to: .prompt)
+                } else if !inNotchZone {
+                    // Drop outside notch zone → install Mochi on the desktop.
+                    // Prevent hideDragGhost from closing the ghost panel so we can promote it.
+                    let ghost = self.dragGhostPanel
+                    self.dragGhostPanel = nil   // nil first so hideDragGhost skips close
+                    self.hideDragGhost()        // resets isDraggingBot, closes highlight panel
+                    DesktopMochiController.shared.install(ghostPanel: ghost, at: mouse)
+                } else {
+                    // Drop back in notch zone → Mochi returns to notch
+                    self.hideDragGhost()
+                }
+                #else
+                let inNotchZoneAS = self.window?.frame.contains(mouse) == true
+                if !inNotchZoneAS {
+                    let ghost = self.dragGhostPanel
+                    self.dragGhostPanel = nil
+                    self.hideDragGhost()
+                    DesktopMochiController.shared.install(ghostPanel: ghost, at: mouse)
+                } else {
+                    self.hideDragGhost()
                 }
                 #endif
             }
@@ -556,8 +895,12 @@ final class IslandWindowController: NSWindowController {
                 } else {
                     self.attachDragStart = nil
                     if hadPendingClick && self.state.mode != .expanded {
-                        self.fsm.forceExpand()
-                        self.expand(to: self.defaultView())
+                        if self.fsm.state == .home {
+                            // FSM already thinks it's open (e.g. the view folded it): just reopen.
+                            self.expand(to: self.defaultView())
+                        } else {
+                            self.fsm.click()   // FSM petit/hidden→home; onTransition calls expand(to:)
+                        }
                     }
                 }
             }
@@ -567,16 +910,20 @@ final class IslandWindowController: NSWindowController {
             finishDrag()
         }
 
-        // Global hotkey to show island
-        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            Task { @MainActor in
-                guard let self, self.state.hotkeyEnabled else { return }
-                let pressed = event.modifierFlags.intersection([.command, .control, .option, .shift]).rawValue
-                guard pressed == self.state.hotkeyFlags, event.keyCode == self.state.hotkeyCode else { return }
-                if self.state.mode == .hidden || self.state.mode == .compact {
-                    self.expand(to: .overview)
+        NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { [weak self] event in
+            guard let self else { return event }
+            MainActor.assumeIsolated {
+                guard self.wasInIsland, self.isBotHit(event.locationInWindow) else { return }
+                guard !self.state.mochiOnDesktop else { return }
+                if self.state.mode == .expanded && self.state.view == .wardrobe {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                        self.state.view = .overview
+                    }
+                } else {
+                    self.expand(to: .wardrobe)
                 }
             }
+            return event
         }
 
         // Track last external app for window context capture
@@ -744,7 +1091,7 @@ final class IslandWindowController: NSWindowController {
 
     // MARK: - Window context at screen point (for drag-attach)
 
-    private func windowContextAtPoint(_ screenPoint: NSPoint) -> PromptContext? {
+    func windowContextAtPoint(_ screenPoint: NSPoint) -> PromptContext? {
         let screen = window?.screen ?? NSScreen.main
         // CGWindowList uses top-left origin; NSEvent.mouseLocation uses bottom-left
         let screenMaxY = screen?.frame.maxY ?? NSScreen.main!.frame.maxY
@@ -858,7 +1205,7 @@ final class IslandWindowController: NSWindowController {
         let islandMinX = (panelW - islandW) / 2
         let (cx, cy, diameter, _) = botPosition(mode: s.mode, view: s.view,
                                                   islandW: islandW, islandH: islandH,
-                                                  uploadProgress: s.uploadProgress)
+                                                  uploadProgress: s.uploadProgress, hasNotch: s.hasNotch)
         let radius = (diameter / 0.6) / 2
         // botPosition cy is from island TOP; panel AppKit coords have y=0 at bottom
         // island top in AppKit coords = panelH (island glued to top of panel/screen)
@@ -869,126 +1216,56 @@ final class IslandWindowController: NSWindowController {
         return dx*dx + dy*dy <= radius * radius
     }
 
-    // MARK: - Screen relocation & Multi-screen support (Nomad Island)
-
-    @objc private func handleScreenParametersChanged() {
-        let screen = Self.targetScreen(for: NSEvent.mouseLocation)
-        relocate(to: screen, force: true, animated: false)
-    }
-
-    private func scheduleNomadRelocation(to targetScreen: NSScreen) {
-        guard pendingRelocateScreen != targetScreen else { return }
-        screenRelocateTimer?.cancel()
-        pendingRelocateScreen = targetScreen
-
-        let item = DispatchWorkItem { [weak self] in
-            guard let self = self else { return }
-            self.pendingRelocateScreen = nil
-            let currentTarget = Self.targetScreen(for: NSEvent.mouseLocation)
-            if currentTarget == targetScreen {
-                self.relocate(to: targetScreen, animated: true)
-            }
-        }
-        screenRelocateTimer = item
-        // 350ms latency debounce: lets cursor settle on the monitor before moving
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: item)
-    }
-
-    func relocate(to screen: NSScreen, force: Bool = false, animated: Bool = false) {
-        guard let panel = window as? IslandPanel else { return }
-        screenRelocateTimer?.cancel()
-        pendingRelocateScreen = nil
-
-        let targetOrg = targetOrigin(for: screen)
-        if !force && currentScreen == screen && panel.frame.origin == targetOrg {
-            return
-        }
-
-        if animated && !force && state.mode != .hidden && panel.alphaValue > 0.05 {
-            isRelocating = true
-            NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.15
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
-                panel.animator().alphaValue = 0.0
-            }, completionHandler: { [weak self] in
-                guard let self = self else { return }
-                self.applyScreenCoordinates(screen: screen, targetOrigin: targetOrg, panel: panel)
-                NSAnimationContext.runAnimationGroup({ ctx in
-                    ctx.duration = 0.22
-                    ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                    panel.animator().alphaValue = 1.0
-                }, completionHandler: { [weak self] in
-                    self?.isRelocating = false
-                })
-            })
-        } else {
-            panel.alphaValue = 1.0
-            applyScreenCoordinates(screen: screen, targetOrigin: targetOrg, panel: panel)
-        }
-    }
-
-    private func applyScreenCoordinates(screen: NSScreen, targetOrigin: NSPoint, panel: IslandPanel) {
-        currentScreen = screen
-
-        let nW = Self.notchWidth(for: screen)
-        let nH = Self.notchHeight(for: screen)
-
-        self.notchW = nW
-        self.notchH = nH
-        panel.notchWidth = nW
-        panel.notchHeight = nH
-
-        state.notchWidth = nW
-        state.notchHeight = nH
-        state.screenWidth = screen.frame.width
-        state.hasPhysicalNotch = (screen.safeAreaInsets.top > 0)
-
-        panel.setFrameOrigin(targetOrigin)
-    }
-
-    func relocateToCurrentFocusScreen() {
-        let screen = Self.targetScreen(for: NSEvent.mouseLocation)
-        relocate(to: screen, animated: false)
-    }
-
-    private func targetOrigin(for screen: NSScreen) -> NSPoint {
-        let sf = screen.frame
-        let panelW: CGFloat = 720
-        let panelH: CGFloat = 320
-        return NSPoint(x: sf.midX - panelW / 2, y: sf.maxY - panelH)
-    }
-
     // MARK: - Screen detection (static)
-
-    static func targetScreen(for mousePoint: NSPoint = NSEvent.mouseLocation) -> NSScreen {
-        if let s = NSScreen.screens.first(where: {
-            mousePoint.x >= $0.frame.minX && mousePoint.x <= $0.frame.maxX &&
-            mousePoint.y >= $0.frame.minY && mousePoint.y <= $0.frame.maxY
-        }) {
-            return s
-        }
-        return NSScreen.main ?? notchScreen() ?? NSScreen.screens.first ?? NSScreen.main!
-    }
 
     static func notchScreen() -> NSScreen? {
         NSScreen.screens.first { $0.safeAreaInsets.top > 0 }
     }
 
-    static func notchWidth(for screen: NSScreen) -> CGFloat {
-        guard screen.safeAreaInsets.top > 0 else {
-            return IslandConst.notchWidth
-        }
-        let aux = (screen.auxiliaryTopLeftArea?.width ?? 0) +
-                  (screen.auxiliaryTopRightArea?.width ?? 0)
-        let w = screen.frame.width - aux
-        return w > 0 ? w : IslandConst.notchWidth
+    /// Top of the menu-bar screen in AppKit coordinates: origin of `DesktopSpace`.
+    static var desktopTop: CGFloat { NSScreen.screens.first?.frame.maxY ?? 0 }
+
+    /// Screen the island currently sits on (Settings window, desktop Mochi flights).
+    private(set) static var currentScreen: NSScreen?
+
+    static func islandScreen() -> NSScreen {
+        if let s = currentScreen, NSScreen.screens.contains(s) { return s }
+        return notchScreen() ?? NSScreen.main!
     }
 
-    static func notchHeight(for screen: NSScreen) -> CGFloat {
-        guard screen.safeAreaInsets.top > 0 else {
-            return IslandConst.notchHeight
+    /// Screen matching the user's choice; falls back to the notch screen, then the main one.
+    static func targetScreen(for choice: IslandDisplayChoice) -> NSScreen {
+        let screens = NSScreen.screens
+        let mouse = NSEvent.mouseLocation
+        let candidates = screens.map {
+            IslandDisplayCandidate(uuid: displayUUID($0), hasNotch: $0.safeAreaInsets.top > 0,
+                                   containsMouse: $0.frame.contains(mouse))
         }
-        return screen.safeAreaInsets.top
+        if let i = IslandDisplayResolver.index(for: choice, in: candidates) { return screens[i] }
+        return notchScreen() ?? NSScreen.main ?? screens[0]
+    }
+
+    /// Stable display UUID (the NSScreenNumber can change after a reboot or a replug).
+    static func displayUUID(_ screen: NSScreen) -> String? {
+        let key = NSDeviceDescriptionKey("NSScreenNumber")
+        guard let number = screen.deviceDescription[key] as? NSNumber,
+              let uuid = CGDisplayCreateUUIDFromDisplayID(number.uint32Value)?.takeRetainedValue()
+        else { return nil }
+        return CFUUIDCreateString(nil, uuid) as String
+    }
+
+    static func screenGeometry(for screen: NSScreen) -> IslandScreenGeometry {
+        let visibleMenuBarHeight = screen.frame.maxY - screen.visibleFrame.maxY
+        // visibleFrame includes the menu bar only while it is visible. Keep a
+        // small resting bar when menus auto-hide or the app is in full screen.
+        let menuBarHeight = visibleMenuBarHeight > 0
+            ? visibleMenuBarHeight : NSStatusBar.system.thickness
+        return IslandScreenGeometry(
+            screenWidth: screen.frame.width, safeAreaTop: screen.safeAreaInsets.top,
+            auxiliaryLeftWidth: screen.auxiliaryTopLeftArea?.width,
+            auxiliaryRightWidth: screen.auxiliaryTopRightArea?.width,
+            menuBarHeight: menuBarHeight
+        )
     }
 
     nonisolated func cleanup() {
@@ -1057,14 +1334,23 @@ extension Notification.Name {
     static let botGulp          = Notification.Name("notchBuddy.botGulp")
     static let botMorphTo       = Notification.Name("notchBuddy.botMorphTo")
     static let islandAction     = Notification.Name("notchBuddy.islandAction")
-    static let islandCollapse   = Notification.Name("notchBuddy.islandCollapse")
-    static let islandHide       = Notification.Name("notchBuddy.islandHide")
-    static let openFullSettings = Notification.Name("notchBuddy.openFullSettings")
+    static let islandCollapse      = Notification.Name("notchBuddy.islandCollapse")
+    static let islandHide          = Notification.Name("notchBuddy.islandHide")
+    static let islandSendMessage   = Notification.Name("notchBuddy.islandSendMessage")
+    static let islandNewConversation = Notification.Name("notchBuddy.islandNewConversation")
+    static let islandToggleDiff           = Notification.Name("notchBuddy.islandToggleDiff")
+    static let islandActivateCardSelection = Notification.Name("notchBuddy.islandActivateCardSelection")
+    static let openFullSettings    = Notification.Name("notchBuddy.openFullSettings")
     static let hookReveal       = Notification.Name("notchBuddy.hookReveal")
+    static let musicReveal      = Notification.Name("notchBuddy.musicReveal")
     // Greeting ↔ IslandWindowController
     static let greetComplete    = Notification.Name("notchBuddy.greetComplete")
+    static let checkMondayRecap = Notification.Name("notchBuddy.checkMondayRecap")
     static let greetingHover    = Notification.Name("notchBuddy.greetingHover")
     static let greetingInterrupt = Notification.Name("notchBuddy.greetingInterrupt")
+    static let openWardrobeFromDesktop = Notification.Name("notchBuddy.openWardrobeFromDesktop")
+    // Island moved to another screen (resting size may differ: notch vs bar)
+    static let islandScreenChanged = Notification.Name("notchBuddy.islandScreenChanged")
 }
 
 // MARK: - islandSize (takes real notch dimensions)
@@ -1078,6 +1364,9 @@ func islandSize(mode: IslandMode, view: IslandView,
     case .compact:  return (nw + 160, nh)
     case .expanded:
         let layout = IslandConst.viewLayouts[view]!
+        if view == .question, let h = QuestionLayout.height {
+            return (IslandConst.expandedWidth, h)
+        }
         return (IslandConst.expandedWidth, layout.height)
     }
 }
