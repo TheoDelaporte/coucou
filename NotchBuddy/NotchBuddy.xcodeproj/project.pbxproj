@@ -29,6 +29,7 @@
 		2DEB459FBD0BA3CEAAA5FDE9 /* ClaudeService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A83D5410BD030B243ADDCFF4 /* ClaudeService.swift */; };
 		2F36E3C6C073E968A682AFA4 /* NotionPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE03E03D1804B0B92C5C2DAD /* NotionPoller.swift */; };
 		3756B7E1A55D9CEC8C4D34A4 /* IslandStateMachine.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8212018F09EA1E96FBD63CD /* IslandStateMachine.swift */; };
+		3CC4A8D8B5A2AEB2C09E067B /* AudioMixerService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE19262FBFAA55EE0A2FF293 /* AudioMixerService.swift */; };
 		3F19756A396F125EC711247F /* IslandTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D3CE3617E9D336DDBA10F7A /* IslandTypes.swift */; };
 		4117E7C8AA231AAE36E7509D /* UploadCanvasView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B241B043223AFBBFB7418A5E /* UploadCanvasView.swift */; };
 		4F1E0B3C838DA3CD6F864BC0 /* CalcomPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3104222B3F17BA5E8DEA5277 /* CalcomPoller.swift */; };
@@ -44,6 +45,7 @@
 		878924960FC0F2B3524D48AC /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 192844E7299DEED5C2372067 /* AppDelegate.swift */; };
 		8C32A0C3EAF536D3836F61D5 /* GreetingCanvasView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C581F7B1A9F14B281B60063E /* GreetingCanvasView.swift */; };
 		8D1C01F283FA7806119A1C85 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C1A7D5CBE2AC084A10C5FF3 /* SettingsView.swift */; };
+		94F42885CD56835A9EF384A6 /* AudioMixerService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE19262FBFAA55EE0A2FF293 /* AudioMixerService.swift */; };
 		967B525F7D3837F31D740D18 /* ResendPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61B5FDDE03F5F711146937E2 /* ResendPoller.swift */; };
 		9DD56C95ECABDDCE23652D50 /* HookServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79D8DD79C3DD9BBC584B3CB2 /* HookServer.swift */; };
 		B3EC9CF3C8BD629C3530E8F1 /* sounds in Resources */ = {isa = PBXBuildFile; fileRef = C066E2B991AA4F56B2724263 /* sounds */; };
@@ -93,6 +95,7 @@
 		B241B043223AFBBFB7418A5E /* UploadCanvasView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UploadCanvasView.swift; sourceTree = "<group>"; };
 		B89DA1A0C21AE3535A1760BB /* N8nPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = N8nPoller.swift; sourceTree = "<group>"; };
 		BE03E03D1804B0B92C5C2DAD /* NotionPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotionPoller.swift; sourceTree = "<group>"; };
+		BE19262FBFAA55EE0A2FF293 /* AudioMixerService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioMixerService.swift; sourceTree = "<group>"; };
 		C066E2B991AA4F56B2724263 /* sounds */ = {isa = PBXFileReference; lastKnownFileType = folder; name = sounds; path = Resources/sounds; sourceTree = SOURCE_ROOT; };
 		C2E4F18AA940EFF7E047B9F7 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
 		C581F7B1A9F14B281B60063E /* GreetingCanvasView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GreetingCanvasView.swift; sourceTree = "<group>"; };
@@ -111,6 +114,7 @@
 				02DCB9D6FE16254723C5F306 /* AntigravityContextService.swift */,
 				192844E7299DEED5C2372067 /* AppDelegate.swift */,
 				C2E4F18AA940EFF7E047B9F7 /* AppState.swift */,
+				BE19262FBFAA55EE0A2FF293 /* AudioMixerService.swift */,
 				A29F4C0B02BE91654D02AA0C /* BotCanvasView.swift */,
 				D4540F630F8BA04AFFFA3979 /* BotEngine.swift */,
 				3104222B3F17BA5E8DEA5277 /* CalcomPoller.swift */,
@@ -281,6 +285,7 @@
 				073CEDA168B17AEFB7AE7DD8 /* AntigravityContextService.swift in Sources */,
 				C940B651C6CA952D99388E04 /* AppDelegate.swift in Sources */,
 				1F11EC4E6F604C612A1ADAD1 /* AppState.swift in Sources */,
+				94F42885CD56835A9EF384A6 /* AudioMixerService.swift in Sources */,
 				CD8DECA66B9E09C97E469DB9 /* BotCanvasView.swift in Sources */,
 				C24D863967D8D32D828ED4B1 /* BotEngine.swift in Sources */,
 				4F1E0B3C838DA3CD6F864BC0 /* CalcomPoller.swift in Sources */,
@@ -316,6 +321,7 @@
 				193B5A853AD635A4C18F6224 /* AntigravityContextService.swift in Sources */,
 				878924960FC0F2B3524D48AC /* AppDelegate.swift in Sources */,
 				61F73B27A7E3AFF584B2CC22 /* AppState.swift in Sources */,
+				3CC4A8D8B5A2AEB2C09E067B /* AudioMixerService.swift in Sources */,
 				651FA3F09608DE5D02D61CCE /* BotCanvasView.swift in Sources */,
 				0E9CE475EC53C67DAB00F8E5 /* BotEngine.swift in Sources */,
 				1969590AFEE6CB21404346F1 /* CalcomPoller.swift in Sources */,

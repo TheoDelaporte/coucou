@@ -26,6 +26,8 @@
 	<string>Pour lire le titre de la fenêtre active et l'attacher comme contexte.</string>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>Pour sauter au terminal et envoyer des mails.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Pour ajuster le volume sonore par application.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>

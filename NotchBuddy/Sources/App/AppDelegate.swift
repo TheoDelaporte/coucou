@@ -27,6 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.delegate = self
         menu.addItem(withTitle: "Open Coucou", action: #selector(openIsland), keyEquivalent: "")
+        menu.addItem(withTitle: "Audio Mixer…", action: #selector(openAudioMixer), keyEquivalent: "m")
         let dndItem = NSMenuItem(title: "Do Not Disturb", action: #selector(toggleDND), keyEquivalent: "")
         dndItem.state = AppState.shared.isDND ? .on : .off
         menu.addItem(dndItem)
@@ -61,6 +62,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openIsland() {
         islandController?.expand(to: .overview)
+    }
+
+    @objc private func openAudioMixer() {
+        islandController?.expand(to: .audio)
     }
 
     @objc private func toggleDND() {

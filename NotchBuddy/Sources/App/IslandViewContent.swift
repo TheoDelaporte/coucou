@@ -24,6 +24,7 @@ struct IslandViewContent: View {
         case .result:    ResultView(state: state)
         case .note:      NoteView(state: state)
         case .settings:  SettingsIslandView(state: state)
+        case .audio:     AudioMixerIslandView(state: state)
         case .greeting:  EmptyView()  // GreetingCanvasView overlaid in IslandRootView
         }
     }
@@ -2901,5 +2902,192 @@ extension Color {
             green: min(1, Double(components.greenComponent) + amount),
             blue: min(1, Double(components.blueComponent) + amount)
         )
+    }
+}
+
+// MARK: - Audio Mixer View
+
+struct AudioMixerIslandView: View {
+    @ObservedObject var state: AppState
+    @ObservedObject private var audioService = AudioMixerService.shared
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            CardBackground(wash: nil)
+
+            VStack(alignment: .leading, spacing: 8) {
+                // Header row: device name + master volume
+                HStack(spacing: 8) {
+                    Image(systemName: "speaker.wave.2.fill")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color(hex: "#38BDF8"))
+
+                    Text(audioService.outputDeviceName)
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundColor(Color(hex: "#F5F6F8"))
+                        .lineLimit(1)
+
+                    Spacer(minLength: 8)
+
+                    Text("Général")
+                        .font(.system(size: 10.5))
+                        .foregroundColor(Color(hex: "#8E939C"))
+
+                    Slider(value: Binding(
+                        get: { Double(audioService.masterVolume) },
+                        set: { audioService.setMasterVolume(Float($0)) }
+                    ), in: 0...1)
+                    .frame(width: 80)
+
+                    Text("\(Int(round(audioService.masterVolume * 100)))%")
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundColor(Color(hex: "#8E939C"))
+                        .frame(width: 32, alignment: .trailing)
+                }
+                .padding(.bottom, 2)
+
+                if !audioService.hasPermission {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 11))
+                            .foregroundColor(Color(hex: "#EAB308"))
+                        Text("Accès audio requis pour ajuster le son par app.")
+                            .font(.system(size: 10.5))
+                            .foregroundColor(Color(hex: "#EAB308"))
+                        Spacer()
+                        Button("Autoriser") {
+                            audioService.requestPermission()
+                        }
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundColor(Color(hex: "#F5F6F8"))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color(hex: "#EAB308").opacity(0.3))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                    }
+                    .padding(.vertical, 2)
+                }
+
+                if audioService.apps.isEmpty {
+                    HStack(spacing: 12) {
+                        Image(systemName: "waveform")
+                            .font(.system(size: 18))
+                            .foregroundColor(Color(hex: "#5F646D"))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Aucune application ne lit de son actuellement")
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundColor(Color(hex: "#C5C8CD"))
+                            Text("Lancez un jeu, un film ou de la musique pour régler son volume indépendamment.")
+                                .font(.system(size: 10.5))
+                                .foregroundColor(Color(hex: "#6B7079"))
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 6)
+                } else {
+                    ScrollView(.vertical, showsIndicators: false) {
+                        VStack(spacing: 6) {
+                            ForEach(audioService.apps) { app in
+                                AudioAppRowView(app: app, audioService: audioService)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 74)
+                }
+            }
+            .padding(.leading, 84)
+            .padding(.trailing, 16)
+            .padding(.vertical, 10)
+        }
+        .onAppear {
+            audioService.startMonitoring()
+        }
+        .onDisappear {
+            audioService.stopMonitoring()
+        }
+    }
+}
+
+struct AudioAppRowView: View {
+    let app: AudioApp
+    let audioService: AudioMixerService
+
+    var body: some View {
+        HStack(spacing: 8) {
+            // Icon
+            if let icon = app.icon {
+                Image(nsImage: icon)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 18, height: 18)
+                    .clipShape(RoundedRectangle(cornerRadius: 3.5))
+            } else {
+                Image(systemName: "app.fill")
+                    .font(.system(size: 14))
+                    .foregroundColor(Color(hex: "#8E939C"))
+                    .frame(width: 18, height: 18)
+            }
+
+            // Name
+            Text(app.name)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundColor(Color(hex: "#F5F6F8"))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(width: 100, alignment: .leading)
+
+            // Mute toggle
+            Button(action: {
+                audioService.toggleMute(for: app)
+            }) {
+                Image(systemName: app.isMuted ? "speaker.slash.fill" : "speaker.wave.2")
+                    .font(.system(size: 10))
+                    .foregroundColor(app.isMuted ? Color(hex: "#F4505E") : Color(hex: "#8E939C"))
+                    .frame(width: 20, height: 20)
+                    .background(app.isMuted ? Color(hex: "#F4505E").opacity(0.15) : Color.white.opacity(0.06))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .help(app.isMuted ? "Réactiver le son" : "Couper le son")
+
+            // Slider
+            Slider(value: Binding(
+                get: { Double(app.volume) },
+                set: { audioService.setVolume(for: app, volume: Float($0)) }
+            ), in: 0...1.0)
+            .opacity(app.isMuted ? 0.35 : 1.0)
+
+            // Percentage / reset button
+            Button(action: {
+                audioService.resetVolume(for: app)
+            }) {
+                Text(app.isMuted ? "0%" : "\(app.displayVolumePercent)%")
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundColor(app.volume != 1.0 || app.isMuted ? Color(hex: "#38BDF8") : Color(hex: "#8E939C"))
+                    .frame(width: 32, alignment: .trailing)
+            }
+            .buttonStyle(.plain)
+            .help("Cliquer pour réinitialiser à 100%")
+
+            if app.volume != 1.0 || app.isMuted {
+                Button(action: {
+                    audioService.resetVolume(for: app)
+                }) {
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.system(size: 8, weight: .medium))
+                        .foregroundColor(Color(hex: "#8E939C"))
+                        .frame(width: 14, height: 14)
+                }
+                .buttonStyle(.plain)
+                .help("Réinitialiser à 100%")
+            } else {
+                Spacer()
+                    .frame(width: 14)
+            }
+        }
+        .padding(.vertical, 2)
+        .padding(.horizontal, 6)
+        .background(Color.white.opacity(0.03))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 }
