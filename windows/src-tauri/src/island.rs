@@ -12,16 +12,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Monitor, PhysicalPosition, PhysicalSize, WebviewWindow};
 
-use windows::Win32::Foundation::{HWND, POINT};
-use windows::core::BOOL;
-use windows::Win32::Foundation::LPARAM;
-use windows::Win32::System::Ole::RevokeDragDrop;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
-use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetClassNameW};
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW,
-};
+use crate::platform::{self, cursor_physical, left_button_down};
 
 /// Logical size of the full window — the largest island view, like the macOS panel.
 pub const PANEL_W: f64 = 720.0;
@@ -68,7 +59,7 @@ pub struct PollGate {
     cv: Condvar,
     pub collapsed: AtomicBool,
     pub rect: Mutex<IslandRect>,
-    /// Mirrors the window flag so we only call into Win32 when it changes.
+    /// Mirrors the window flag so we only call into the OS when it changes.
     ignoring: AtomicBool,
 }
 
@@ -98,65 +89,20 @@ impl PollGate {
         self.cv.notify_all();
     }
 
-    fn wait_until_active(&self) {
+    pub(crate) fn wait_until_active(&self) {
         let mut guard = self.active.lock().unwrap();
         while !*guard {
             guard = self.cv.wait(guard).unwrap();
         }
     }
 
-    fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         *self.active.lock().unwrap()
     }
 }
 
 pub fn window(app: &AppHandle) -> Option<WebviewWindow> {
     app.get_webview_window(WINDOW_LABEL)
-}
-
-fn cursor_physical() -> Option<(f64, f64)> {
-    let mut p = POINT::default();
-    unsafe { GetCursorPos(&mut p).ok()? };
-    Some((p.x as f64, p.y as f64))
-}
-
-/// Lets dropped files reach the app again.
-///
-/// wry installs its drop target by walking the webview's child windows **once**,
-/// when the webview is created. WebView2 creates `Chrome_RenderWidgetHostHWND`
-/// later and registers its own target on it; being the innermost window, that one
-/// wins, and since the page has no HTML5 drop handler it refuses everything — the
-/// "no drop" cursor, with nothing reaching Tauri. Revoking it makes OLE fall
-/// through to the target wry registered on the parent widget, which is the one
-/// that feeds Tauri's drag events.
-///
-/// Cheap and idempotent, so it is simply re-run whenever a drag might be starting.
-pub fn unblock_webview_drops(app: &AppHandle) {
-    for label in [WINDOW_LABEL, "settings"] {
-        let Some(win) = app.get_webview_window(label) else { continue };
-        let Some(hwnd) = hwnd_of(&win) else { continue };
-        unsafe {
-            let _ = EnumChildWindows(Some(hwnd), Some(revoke_render_widget), LPARAM(0));
-        }
-    }
-}
-
-unsafe extern "system" fn revoke_render_widget(hwnd: HWND, _: LPARAM) -> BOOL {
-    let mut name = [0u16; 64];
-    let len = unsafe { GetClassNameW(hwnd, &mut name) };
-    if len > 0 {
-        let class = String::from_utf16_lossy(&name[..len as usize]);
-        if class == "Chrome_RenderWidgetHostHWND" {
-            let _ = unsafe { RevokeDragDrop(hwnd) };
-        }
-    }
-    true.into()
-}
-
-/// True while the left mouse button is held — the only signal we get that a
-/// drag might be in flight before it reaches the window.
-fn left_button_down() -> bool {
-    unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 }
 }
 
 fn monitor_contains(m: &Monitor, x: f64, y: f64) -> bool {
@@ -168,9 +114,117 @@ fn monitor_contains(m: &Monitor, x: f64, y: f64) -> bool {
         && y < (p.y + s.height as i32) as f64
 }
 
-/// The display the island lives on: the primary one, or the one under the cursor.
+/// A display's logical origin, the key `at:<x>,<y>` preferences are matched on.
+/// Names are no good for that: two monitors of the same model share one.
+fn logical_origin(m: &Monitor) -> (i32, i32) {
+    let scale = m.scale_factor();
+    let p = m.position();
+    ((p.x as f64 / scale).round() as i32, (p.y as f64 / scale).round() as i32)
+}
+
+/// One entry of the "Island lives on" list in Settings.
+#[derive(Serialize, Clone)]
+pub struct MonitorChoice {
+    pub key: String,
+    pub label: String,
+}
+
+pub fn monitor_choices(app: &AppHandle) -> Vec<MonitorChoice> {
+    let Ok(monitors) = app.available_monitors() else { return Vec::new() };
+    monitors
+        .iter()
+        .map(|m| {
+            let d = describe(m);
+            MonitorChoice {
+                key: d.key(),
+                label: crate::i18n::tf(
+                    "{name} — {width}×{height} at {x},{y}",
+                    &[
+                        ("name", &d.name),
+                        ("width", &d.w.to_string()),
+                        ("height", &d.h.to_string()),
+                        ("x", &d.x.to_string()),
+                        ("y", &d.y.to_string()),
+                    ],
+                ),
+            }
+        })
+        .collect()
+}
+
+/// What a display is remembered by: its logical origin, plus its name and
+/// logical size, so it is still found after the layout is rearranged or the
+/// resolution changes (the Mac keeps the display's UUID for the same reason;
+/// Tauri has no stable ID).
+#[derive(Debug, Clone, PartialEq)]
+struct DisplayId {
+    name: String,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+impl DisplayId {
+    /// `at:<x>,<y>` stays first, so a preference saved before still matches.
+    fn key(&self) -> String {
+        format!("at:{},{}|{}|{}x{}", self.x, self.y, self.name.replace('|', " "), self.w, self.h)
+    }
+}
+
+fn describe(m: &Monitor) -> DisplayId {
+    let (x, y) = logical_origin(m);
+    let scale = m.scale_factor();
+    let s = m.size();
+    DisplayId {
+        name: m.name().cloned().unwrap_or_else(|| "Display".into()),
+        x,
+        y,
+        w: (s.width as f64 / scale).round() as i32,
+        h: (s.height as f64 / scale).round() as i32,
+    }
+}
+
+/// Which display a saved `at:` preference points at, best match first: same
+/// place and name; the same name and size elsewhere (layout rearranged); the
+/// same name alone when unique (resolution changed); the same place. None
+/// means unplugged, and the caller falls back to the primary display.
+fn pick_display(pref: &str, displays: &[DisplayId]) -> Option<usize> {
+    let rest = pref.strip_prefix("at:")?;
+    let mut parts = rest.split('|');
+    let (x, y) = parts.next()?.split_once(',')?;
+    let (x, y) = (x.trim().parse::<i32>().ok()?, y.trim().parse::<i32>().ok()?);
+    let name = parts.next();
+    let size = parts.next().and_then(|s| {
+        let (w, h) = s.split_once('x')?;
+        Some((w.parse::<i32>().ok()?, h.parse::<i32>().ok()?))
+    });
+    let at = |d: &DisplayId| d.x == x && d.y == y;
+    if let Some(name) = name {
+        if let Some(i) = displays.iter().position(|d| at(d) && d.name == name) {
+            return Some(i);
+        }
+        if let Some((w, h)) = size {
+            if let Some(i) = displays.iter().position(|d| d.name == name && d.w == w && d.h == h) {
+                return Some(i);
+            }
+        }
+        let mut same_name = displays.iter().enumerate().filter(|(_, d)| d.name == name);
+        if let (Some((i, _)), None) = (same_name.next(), same_name.next()) {
+            return Some(i);
+        }
+    }
+    displays.iter().position(at)
+}
+
+/// The display the island lives on: a chosen one, the primary one, or the one
+/// under the cursor.
 fn target_monitor(app: &AppHandle, pref: &str) -> Option<Monitor> {
     let monitors = app.available_monitors().ok()?;
+    let ids: Vec<DisplayId> = monitors.iter().map(describe).collect();
+    if let Some(i) = pick_display(pref, &ids) {
+        return Some(monitors[i].clone());
+    }
     if pref == "cursor" {
         if let Some((cx, cy)) = cursor_physical() {
             if let Some(m) = monitors.iter().find(|m| monitor_contains(m, cx, cy)) {
@@ -182,6 +236,48 @@ fn target_monitor(app: &AppHandle, pref: &str) -> Option<Monitor> {
         .ok()
         .flatten()
         .or_else(|| monitors.into_iter().next())
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    fn d(name: &str, x: i32, y: i32, w: i32, h: i32) -> DisplayId {
+        DisplayId { name: name.into(), x, y, w, h }
+    }
+
+    #[test]
+    fn a_display_is_found_again_after_changes() {
+        let dell = d("DELL U2720Q", 1920, 0, 2560, 1440);
+        let lap = d("eDP-1", 0, 0, 1920, 1200);
+        let key = dell.key();
+        assert_eq!(pick_display(&key, &[lap.clone(), dell.clone()]), Some(1));
+        // Rearranged: the Dell moved to the left of the laptop.
+        let moved = [d("eDP-1", 2560, 0, 1920, 1200), d("DELL U2720Q", 0, 0, 2560, 1440)];
+        assert_eq!(pick_display(&key, &moved), Some(1));
+        // Resolution changed, still the only Dell.
+        let rescaled = [lap.clone(), d("DELL U2720Q", 1920, 0, 1920, 1080)];
+        assert_eq!(pick_display(&key, &rescaled), Some(1));
+        // Unplugged: nothing, so the caller falls back to the primary display.
+        assert_eq!(pick_display(&key, &[lap.clone()]), None);
+    }
+
+    #[test]
+    fn two_identical_monitors_are_told_apart_by_place() {
+        let a = d("LG 27UL500", 0, 0, 1920, 1080);
+        let b = d("LG 27UL500", 1920, 0, 1920, 1080);
+        assert_eq!(pick_display(&b.key(), &[a.clone(), b.clone()]), Some(1));
+        assert_eq!(pick_display(&a.key(), &[a, b]), Some(0));
+    }
+
+    #[test]
+    fn preferences_saved_before_still_match() {
+        let lap = d("eDP-1", 0, 0, 1920, 1200);
+        let ext = d("HDMI-1", 1920, 0, 1920, 1080);
+        assert_eq!(pick_display("at:1920,0", &[lap.clone(), ext.clone()]), Some(1));
+        assert_eq!(pick_display("primary", &[lap, ext]), None);
+        assert_eq!(pick_display("at:nonsense", &[]), None);
+    }
 }
 
 pub fn screen_info(app: &AppHandle, pref: &str) -> ScreenInfo {
@@ -217,44 +313,20 @@ pub fn apply_geometry(app: &AppHandle, pref: &str, collapsed: bool) {
     let x = mp.x + (ms.width as i32 - pw as i32) / 2;
     let y = mp.y;
 
+    // GTK never sizes a non-resizable window below its natural size (200 px
+    // here), so on Linux the 6 px wake strip would stay a 200 px block. tao
+    // re-applies the config's `resizable: false` after the first configure, so
+    // this is asked every time, just before the resize. Undecorated, the window
+    // still offers the user nothing to resize it by. (Found by @YossiYad, #44.)
+    #[cfg(target_os = "linux")]
+    let _ = win.set_resizable(true);
     let _ = win.set_size(PhysicalSize::new(pw, ph));
     let _ = win.set_position(PhysicalPosition::new(x, y));
+    let (lx, ly) = logical_origin(&m);
+    platform::pin_to_monitor(&win, lx, ly);
     // Moving across displays can rescale the window: re-assert the physical size.
     let _ = win.set_size(PhysicalSize::new(pw, ph));
     let _ = win.set_always_on_top(true);
-}
-
-fn hwnd_of(win: &WebviewWindow) -> Option<HWND> {
-    let raw = win.hwnd().ok()?.0 as isize;
-    if raw == 0 {
-        return None;
-    }
-    Some(HWND(raw as *mut _))
-}
-
-/// WS_EX_NOACTIVATE keeps clicks from stealing focus; WS_EX_TOOLWINDOW keeps the
-/// island out of Alt-Tab.
-pub fn make_non_activating(win: &WebviewWindow) {
-    let Some(hwnd) = hwnd_of(win) else { return };
-    unsafe {
-        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let want = ex | WS_EX_NOACTIVATE.0 as isize | WS_EX_TOOLWINDOW.0 as isize;
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want);
-    }
-}
-
-/// Temporarily allow activation so a text field inside the island can be typed in.
-pub fn set_activating(win: &WebviewWindow, activating: bool) {
-    let Some(hwnd) = hwnd_of(win) else { return };
-    unsafe {
-        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let want = if activating {
-            ex & !(WS_EX_NOACTIVATE.0 as isize)
-        } else {
-            ex | WS_EX_NOACTIVATE.0 as isize
-        };
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want);
-    }
 }
 
 /// Position, size and scale of the monitor the island lives on. Any change here
@@ -278,19 +350,23 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
         // Remembered across wakes so a display change while hidden is noticed the
         // moment the island comes back.
         let mut last_screen: Option<(i32, i32, u32, u32, u64)> = None;
+        // Without a cursor to read (Linux) the loop only watches the display
+        // layout, and twice a second is plenty for that: waking at 60 Hz just to
+        // find no cursor costs CPU for nothing.
+        let (period, screen_every) = if platform::CURSOR_POLL { (16, 30) } else { (500, 1) };
         loop {
             gate.wait_until_active();
             let mut last = (f64::MIN, f64::MIN);
             let mut ticks: u32 = 0;
             while gate.is_active() {
-                std::thread::sleep(Duration::from_millis(16));
+                std::thread::sleep(Duration::from_millis(period));
 
                 // Monitors get plugged in, unplugged, rearranged and rescaled, and
                 // an island pinned to coordinates that no longer exist is an island
                 // nobody can reach. Checked about twice a second — the cursor poll
                 // is already running, so this costs one monitor query.
                 ticks = ticks.wrapping_add(1);
-                if ticks % 30 == 0 {
+                if ticks % screen_every == 0 {
                     let now = current_screen_key(&app);
                     if now.is_some() && now != last_screen {
                         let first = last_screen.is_none();
@@ -339,7 +415,7 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
                 let down = left_button_down();
                 if down && !was_down {
                     let handle = app.clone();
-                    let _ = app.run_on_main_thread(move || unblock_webview_drops(&handle));
+                    let _ = app.run_on_main_thread(move || platform::unblock_webview_drops(&handle));
                 }
                 was_down = down;
 
@@ -359,6 +435,39 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
             }
         }
     });
+}
+
+/// Re-applies click-through after the window or the island changed shape.
+///
+/// With the cursor poll (Windows) the window takes the mouse again and the next
+/// tick decides from the cursor. Without it (Linux) the input region is set to
+/// the island itself, or to the whole wake strip while collapsed.
+pub fn refresh_click_through(app: &AppHandle, gate: &PollGate) {
+    if platform::CURSOR_POLL {
+        set_ignore_cursor(app, false);
+        gate.forget_ignore_state();
+        return;
+    }
+    let Some(win) = window(app) else { return };
+    let region = if gate.collapsed.load(Ordering::Relaxed) {
+        // The wake strip itself, never "the whole window": if the window ever
+        // fails to shrink to the strip, the rest of it must not swallow clicks
+        // meant for whatever sits under the top of the screen.
+        Some((0.0, 0.0, STRIP_W, STRIP_H))
+    } else {
+        let r = *gate.rect.lock().unwrap();
+        if r.w <= 0.0 {
+            // Nothing drawn yet: nothing takes the mouse.
+            Some((0.0, 0.0, 0.0, 0.0))
+        } else {
+            let x0 = (r.x - HIT_MARGIN).max(0.0);
+            let y0 = (r.y - HIT_MARGIN).max(0.0);
+            let x1 = r.x + r.w + HIT_MARGIN;
+            let y1 = r.y + r.h + HIT_MARGIN;
+            Some((x0, y0, x1 - x0, y1 - y0))
+        }
+    };
+    platform::set_input_region(&win, region);
 }
 
 pub fn set_ignore_cursor(app: &AppHandle, ignore: bool) {

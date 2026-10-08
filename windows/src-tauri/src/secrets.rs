@@ -1,5 +1,5 @@
-// API keys live in the Windows Credential Manager, never on disk and never in
-// the front end — the island can only ask whether a key is present.
+// API keys live in the Windows Credential Manager or, on Linux, the Secret
+// Service (GNOME Keyring, KWallet) — never on disk and never in the front end — the island can only ask whether a key is present.
 
 use keyring::Entry;
 
@@ -8,6 +8,10 @@ const SERVICE: &str = "fr.louisraille.coucou";
 /// Every key Coucou may store. Anything outside this list is refused.
 pub const KNOWN_KEYS: &[&str] = &[
     "anthropic-api-key",
+    "openai-api-key",
+    "google-api-key",
+    "openrouter-api-key",
+    "openai-compatible-key",
     "n8n-url",
     "n8n-api-key",
     "vercel-token",
