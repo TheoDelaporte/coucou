@@ -301,8 +301,8 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(Int(hotkeyCode), forKey: "hotkeyCode") }
     }
 
-    // Screen hosting the island (notch screen by default) — persisted
-    @Published var islandDisplay: IslandDisplayChoice = .notch {
+    // Screen hosting the island (follow mouse by default) — persisted
+    @Published var islandDisplay: IslandDisplayChoice = .followMouse {
         didSet { UserDefaults.standard.set(islandDisplay.storageValue, forKey: "islandDisplay") }
     }
 

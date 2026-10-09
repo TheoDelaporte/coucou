@@ -52,6 +52,11 @@ final class IslandWindowController: NSWindowController {
     private var currentScreen: NSScreen?
     private var hasNotch = true
 
+    // Multi-screen / Nomad relocation timing & animation
+    private var screenRelocateTimer: DispatchWorkItem?
+    private var pendingRelocateScreen: NSScreen?
+    private var isRelocating = false
+
     // Island-local key monitor (active only when island is key window)
     private var localKeyMonitor: Any?
 
@@ -190,17 +195,38 @@ final class IslandWindowController: NSWindowController {
         }
     }
 
-    // MARK: - Screen choice
+    // MARK: - Screen choice & Nomad relocation
 
     private func moveToTargetScreen(choice: IslandDisplayChoice) {
         guard !inAttachDrag, attachDragStart == nil else { return }
-        relocate(to: Self.targetScreen(for: choice))
+        relocate(to: Self.targetScreen(for: choice), force: true, animated: false)
     }
 
-    /// Recomputes the resting geometry for `screen` and moves the panel to its top centre.
-    /// Always re-applied, even on the same screen: its menu bar or resolution may have changed.
-    private func relocate(to screen: NSScreen) {
+    private func scheduleNomadRelocation(to targetScreen: NSScreen) {
+        guard pendingRelocateScreen != targetScreen else { return }
+        screenRelocateTimer?.cancel()
+        pendingRelocateScreen = targetScreen
+
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.pendingRelocateScreen = nil
+            let mouse = NSEvent.mouseLocation
+            if let currentTarget = NSScreen.screens.first(where: { $0.frame.contains(mouse) }),
+               currentTarget == targetScreen {
+                self.relocate(to: targetScreen, force: false, animated: true)
+            }
+        }
+        screenRelocateTimer = item
+        // 350ms latency debounce: lets cursor settle on the monitor before moving
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: item)
+    }
+
+    /// Recomputes resting geometry for `screen` and moves panel to its top center with optional fade.
+    private func relocate(to screen: NSScreen, force: Bool = false, animated: Bool = false) {
         guard let panel = window as? IslandPanel else { return }
+        screenRelocateTimer?.cancel()
+        pendingRelocateScreen = nil
+
         let geometry = Self.screenGeometry(for: screen)
         notchW = geometry.width
         notchH = geometry.height
@@ -209,26 +235,68 @@ final class IslandWindowController: NSWindowController {
         panel.notchHeight = notchH
         AppState.shared.notchWidth  = notchW
         AppState.shared.notchHeight = notchH
+        AppState.shared.screenWidth = screen.frame.width
+        AppState.shared.hasPhysicalNotch = geometry.hasNotch
         Self.currentScreen = screen
+        self.currentScreen = screen
 
         let sf = screen.frame
         let size = panel.frame.size
-        panel.setFrame(NSRect(x: sf.midX - size.width/2, y: sf.maxY - size.height,
-                              width: size.width, height: size.height), display: true)
-        // notchWidth/hasNotch are not @Published: tell the views to resize the island.
-        NotificationCenter.default.post(name: .islandScreenChanged, object: nil)
-        state.objectWillChange.send()
+        let targetFrame = NSRect(x: sf.midX - size.width/2, y: sf.maxY - size.height,
+                                 width: size.width, height: size.height)
+
+        if !force && panel.frame == targetFrame { return }
+
+        if animated && !force && state.mode != .hidden && panel.alphaValue > 0.05 {
+            isRelocating = true
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.15
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                panel.animator().alphaValue = 0.0
+            }, completionHandler: { [weak self] in
+                guard let self = self else { return }
+                panel.setFrame(targetFrame, display: true)
+                NotificationCenter.default.post(name: .islandScreenChanged, object: nil)
+                self.state.objectWillChange.send()
+                NSAnimationContext.runAnimationGroup({ ctx in
+                    ctx.duration = 0.22
+                    ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    panel.animator().alphaValue = 1.0
+                }, completionHandler: { [weak self] in
+                    self?.isRelocating = false
+                })
+            })
+        } else {
+            panel.alphaValue = 1.0
+            panel.setFrame(targetFrame, display: true)
+            NotificationCenter.default.post(name: .islandScreenChanged, object: nil)
+            state.objectWillChange.send()
+        }
     }
 
-    /// Follow-the-mouse mode: hop to the cursor's screen while the island is not open,
+    func relocateToCurrentFocusScreen() {
+        guard state.islandDisplay == .followMouse else { return }
+        let mouse = NSEvent.mouseLocation
+        if let target = NSScreen.screens.first(where: { $0.frame.contains(mouse) }),
+           target != Self.currentScreen {
+            relocate(to: target, force: false, animated: false)
+        }
+    }
+
+    /// Follow-the-mouse mode: hop to the cursor's screen smoothly with debounce while the island is not open,
     /// so an approval or a chat never jumps away mid-click.
     private func followMouseIfNeeded(_ mouse: NSPoint) {
         guard state.islandDisplay == .followMouse,
-              state.mode != .expanded, !inAttachDrag, attachDragStart == nil else { return }
-        if let current = Self.currentScreen, current.frame.contains(mouse) { return }
-        guard let target = NSScreen.screens.first(where: { $0.frame.contains(mouse) }),
-              target != Self.currentScreen else { return }
-        relocate(to: target)
+              state.mode != .expanded, !inAttachDrag, attachDragStart == nil, !isRelocating else { return }
+        let activeScreen = currentScreen ?? Self.currentScreen ?? window?.screen
+        guard let target = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) else { return }
+        if target != activeScreen {
+            scheduleNomadRelocation(to: target)
+        } else if pendingRelocateScreen != nil {
+            // Mouse returned to current screen before delay expired: cancel
+            screenRelocateTimer?.cancel()
+            pendingRelocateScreen = nil
+        }
     }
 
     // MARK: - FSM wiring
@@ -463,6 +531,7 @@ final class IslandWindowController: NSWindowController {
     }
 
     func expand(to view: IslandView) {
+        relocateToCurrentFocusScreen()
         state.view = view
         if state.mode == .expanded {
             // Already expanded — just switch view
@@ -766,6 +835,7 @@ final class IslandWindowController: NSWindowController {
         NotificationCenter.default.addObserver(forName: .hookReveal, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
             guard !self.state.isDND else { return }
+            self.relocateToCurrentFocusScreen()
             self.fsm.reveal()
         }
 
