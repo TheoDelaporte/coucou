@@ -16,13 +16,14 @@ enum IslandDisplayChoice: Equatable, Hashable {
     init(storageValue: String) {
         switch storageValue {
         case "menuBar":     self = .menuBar
+        case "notch":       self = .notch
         case "followMouse": self = .followMouse
         default:
             if storageValue.hasPrefix(Self.displayPrefix) {
                 let uuid = String(storageValue.dropFirst(Self.displayPrefix.count))
-                self = uuid.isEmpty ? .notch : .display(uuid: uuid)
+                self = uuid.isEmpty ? .followMouse : .display(uuid: uuid)
             } else {
-                self = .notch
+                self = .followMouse
             }
         }
     }
