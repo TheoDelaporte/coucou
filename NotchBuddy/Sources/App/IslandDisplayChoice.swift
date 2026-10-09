@@ -21,9 +21,9 @@ enum IslandDisplayChoice: Equatable, Hashable {
         default:
             if storageValue.hasPrefix(Self.displayPrefix) {
                 let uuid = String(storageValue.dropFirst(Self.displayPrefix.count))
-                self = uuid.isEmpty ? .followMouse : .display(uuid: uuid)
+                self = uuid.isEmpty ? .notch : .display(uuid: uuid)
             } else {
-                self = .followMouse
+                self = .notch
             }
         }
     }
