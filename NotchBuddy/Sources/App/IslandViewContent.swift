@@ -681,21 +681,98 @@ private func openClaudeDesktopApp() {
 struct FinishedView: View {
     @ObservedObject var state: AppState
 
+    private var task: AgentTask? {
+        state.focusTask
+    }
+
+    private var agentDisplayName: String {
+        if let task = task {
+            if task.id == "agent_antigravity" { return "Antigravity" }
+            if task.id == "integration_claude" { return ClaudeHost.pillName(hostApp: task.hostApp) }
+            if !task.name.isEmpty { return task.name }
+        }
+        return "Antigravity"
+    }
+
+    private var titleText: String {
+        if let fl = task?.finalLine, !fl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return fl
+        }
+        if let s = task?.steps.last(where: { !$0.isDiffStep }), !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return s
+        }
+        return String(localized: "Tâche terminée avec succès")
+    }
+
+    private var diffs: [FileDiff] {
+        guard let task = task else { return [] }
+        return state.sessionDiffs[task.id] ?? []
+    }
+
     var body: some View {
         ZStack {
             CardBackground(wash: .green)
-            VStack(alignment: .leading, spacing: 5) {
-                AgentWho(task: state.focusTask, label: "\(state.focusTask?.name ?? "Session") finished")
-                Text({
-                    if let fl = state.focusTask?.finalLine { return fl }
-                    if let s = state.focusTask?.steps.last(where: { !$0.isDiffStep }) { return s }
-                    return String(localized: "Session finished")
-                }())
-                    .font(.system(size: 15, weight: .semibold))
-                    .lineLimit(1)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 7) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 11, weight: .bold))
+                        Text("Terminé")
+                            .font(.system(size: 11, weight: .bold))
+                    }
+                    .foregroundColor(Color(hex: "#22C55E"))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2.5)
+                    .background(Color(hex: "#22C55E").opacity(0.12))
+                    .clipShape(Capsule())
+
+                    Text(agentDisplayName)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(Color(hex: "#9CA3AF"))
+                }
+
+                Text(titleText)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(Color(hex: "#F5F6F8"))
+                    .lineLimit(2)
                     .truncationMode(.tail)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if !diffs.isEmpty {
+                    let count = diffs.count
+                    let added = diffs.reduce(0) { $0 + $1.added }
+                    let removed = diffs.reduce(0) { $0 + $1.removed }
+                    HStack(spacing: 6) {
+                        Image(systemName: "pencil.and.list.clipboard")
+                            .font(.system(size: 11))
+                            .foregroundColor(Color(hex: "#8E939C"))
+                        Text("\(count) \(count > 1 ? "fichiers modifiés" : "fichier modifié")")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(Color(hex: "#8E939C"))
+                        if added > 0 {
+                            Text("+\(added)")
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .foregroundColor(Color(hex: "#22C55E"))
+                        }
+                        if removed > 0 {
+                            Text("-\(removed)")
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .foregroundColor(Color(hex: "#EF4444"))
+                        }
+                    }
+                } else {
+                    HStack(spacing: 5) {
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 10))
+                            .foregroundColor(Color(hex: "#8E939C"))
+                        Text(String(localized: "Prêt pour la suite"))
+                            .font(.system(size: 11))
+                            .foregroundColor(Color(hex: "#8E939C"))
+                    }
+                }
+
                 HStack(spacing: 8) {
-                    if state.focusTask?.id == "agent_antigravity" {
+                    if task?.id == "agent_antigravity" {
                         PrimaryButton("Open Antigravity") {
                             let ids = ["com.google.antigravity", "com.google.antigravity-ide"]
                             if let app = ids.compactMap({ id in NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == id }) }).first {
@@ -705,7 +782,7 @@ struct FinishedView: View {
                             }
                             NotificationCenter.default.post(name: .islandCollapse, object: nil)
                         }
-                    } else if state.focusTask?.id == "agent_claude-desktop" {
+                    } else if task?.id == "agent_claude-desktop" {
                         // Sessions from the Claude desktop app live there, not in a terminal.
                         PrimaryButton("Open Claude") {
                             openClaudeDesktopApp()
@@ -715,7 +792,6 @@ struct FinishedView: View {
                         #if !APPSTORE
                         PrimaryButton("Open terminal") {
                             // The app the session runs in (its terminal, or VS Code), then any known terminal
-                            let task = state.focusTask
                             if !(task?.id == "integration_claude" && ClaudeHost.activate(task?.hostApp)),
                                !TerminalTarget.activate(sessionBundleId: task?.sessionBundleId) {
                                 NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"))
@@ -724,14 +800,15 @@ struct FinishedView: View {
                         }
                         #endif
                     }
-                    SecondaryButton("OK") {
+                    SecondaryButton("Fermer") {
                         NotificationCenter.default.post(name: .islandCollapse, object: nil)
                     }
                 }
+                .padding(.top, 2)
             }
             .padding(.leading, 116)
             .padding(.trailing, 16)
-            .padding(.vertical, 4)
+            .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
     }

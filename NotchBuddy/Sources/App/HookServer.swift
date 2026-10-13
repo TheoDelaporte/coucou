@@ -883,11 +883,20 @@ final class HookServer: @unchecked Sendable {
             let rawFinal = (payload["last_assistant_message"] as? String)
                 ?? (payload["message"] as? String) ?? ""
             let finalText = DiffEngine.toOneLine(rawFinal)
+            let resolvedFinal: String
             if !finalText.isEmpty {
-                appendStep(id: agentId, step: finalText)
-                if let idx = state.tasks.firstIndex(where: { $0.id == agentId }) {
-                    state.tasks[idx].finalLine = finalText
-                }
+                resolvedFinal = finalText
+            } else if let prompt = payload["prompt"] as? String, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                resolvedFinal = DiffEngine.toOneLine(prompt, maxChars: 80)
+            } else if let firstStep = state.tasks.first(where: { $0.id == agentId })?.steps.first,
+                      !firstStep.isEmpty, !firstStep.hasPrefix("•"), !firstStep.hasPrefix("+"), !firstStep.hasPrefix("⚠") {
+                resolvedFinal = firstStep
+            } else {
+                resolvedFinal = String(localized: "Session finished")
+            }
+            appendStep(id: agentId, step: resolvedFinal)
+            if let idx = state.tasks.firstIndex(where: { $0.id == agentId }) {
+                state.tasks[idx].finalLine = resolvedFinal
             }
             RecapStore.shared.stop(sessionId: recapSessionId)
             SoundEngine.shared.play("finish")
@@ -4146,6 +4155,35 @@ def main():
             except Exception:
                 pass
 
+    if event == 'Stop' and ('last_assistant_message' not in payload or not payload['last_assistant_message']):
+        t_path = payload.get('transcriptPath')
+        if t_path and os.path.exists(t_path):
+            try:
+                with open(t_path, 'r', encoding='utf-8', errors='replace') as f:
+                    for line in reversed(f.readlines()):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except Exception:
+                            continue
+                        t = entry.get('type', '')
+                        src = entry.get('source', '')
+                        role = entry.get('role', '')
+                        if t in ('PLANNER_RESPONSE', 'ASSISTANT_RESPONSE') or src == 'MODEL' or role == 'assistant':
+                            raw = entry.get('content') or entry.get('message') or entry.get('text') or ''
+                            if isinstance(raw, list):
+                                raw = ' '.join(p.get('text', '') if isinstance(p, dict) else str(p) for p in raw)
+                            if raw and isinstance(raw, str):
+                                cleaned = re.sub(r'<thought>.*?</thought>', '', raw, flags=re.DOTALL)
+                                cleaned = re.sub(r'<[^>]+>', '', cleaned).strip()
+                                if cleaned:
+                                    payload['last_assistant_message'] = cleaned
+                                    break
+            except Exception:
+                pass
+
     is_antigravity = ('conversationId' in payload)
 
     socket_dir = os.path.expanduser('~/Library/Application Support/NotchBuddy')
@@ -4772,6 +4810,51 @@ def main():
         pass
 
     event = payload.get('hook_event_name', '')
+    if event == 'PreInvocation' and ('prompt' not in payload or not payload['prompt']):
+        t_path = payload.get('transcriptPath')
+        if t_path and os.path.exists(t_path):
+            try:
+                with open(t_path, 'r', encoding='utf-8') as f:
+                    for line in reversed(f.readlines()):
+                        entry = json.loads(line)
+                        if entry.get('source') == 'USER_EXPLICIT' or entry.get('type') == 'USER_INPUT':
+                            content = entry.get('content', '')
+                            if '<USER_REQUEST>' in content:
+                                content = content.split('<USER_REQUEST>')[1].split('</USER_REQUEST>')[0].strip()
+                            payload['prompt'] = content
+                            break
+            except Exception:
+                pass
+
+    if event == 'Stop' and ('last_assistant_message' not in payload or not payload['last_assistant_message']):
+        t_path = payload.get('transcriptPath')
+        if t_path and os.path.exists(t_path):
+            try:
+                with open(t_path, 'r', encoding='utf-8', errors='replace') as f:
+                    for line in reversed(f.readlines()):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except Exception:
+                            continue
+                        t = entry.get('type', '')
+                        src = entry.get('source', '')
+                        role = entry.get('role', '')
+                        if t in ('PLANNER_RESPONSE', 'ASSISTANT_RESPONSE') or src == 'MODEL' or role == 'assistant':
+                            raw = entry.get('content') or entry.get('message') or entry.get('text') or ''
+                            if isinstance(raw, list):
+                                raw = ' '.join(p.get('text', '') if isinstance(p, dict) else str(p) for p in raw)
+                            if raw and isinstance(raw, str):
+                                cleaned = re.sub(r'<thought>.*?</thought>', '', raw, flags=re.DOTALL)
+                                cleaned = re.sub(r'<[^>]+>', '', cleaned).strip()
+                                if cleaned:
+                                    payload['last_assistant_message'] = cleaned
+                                    break
+            except Exception:
+                pass
+
     is_antigravity = ('conversationId' in payload)
     # socket_path is already defined above
 

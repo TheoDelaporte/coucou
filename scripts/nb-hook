@@ -352,6 +352,35 @@ def main():
             except Exception:
                 pass
 
+    if event == 'Stop' and ('last_assistant_message' not in payload or not payload['last_assistant_message']):
+        t_path = payload.get('transcriptPath')
+        if t_path and os.path.exists(t_path):
+            try:
+                with open(t_path, 'r', encoding='utf-8', errors='replace') as f:
+                    for line in reversed(f.readlines()):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except Exception:
+                            continue
+                        t = entry.get('type', '')
+                        src = entry.get('source', '')
+                        role = entry.get('role', '')
+                        if t in ('PLANNER_RESPONSE', 'ASSISTANT_RESPONSE') or src == 'MODEL' or role == 'assistant':
+                            raw = entry.get('content') or entry.get('message') or entry.get('text') or ''
+                            if isinstance(raw, list):
+                                raw = ' '.join(p.get('text', '') if isinstance(p, dict) else str(p) for p in raw)
+                            if raw and isinstance(raw, str):
+                                cleaned = re.sub(r'<thought>.*?</thought>', '', raw, flags=re.DOTALL)
+                                cleaned = re.sub(r'<[^>]+>', '', cleaned).strip()
+                                if cleaned:
+                                    payload['last_assistant_message'] = cleaned
+                                    break
+            except Exception:
+                pass
+
     is_antigravity = ('conversationId' in payload)
 
     socket_dir = os.path.expanduser('~/Library/Application Support/NotchBuddy')
